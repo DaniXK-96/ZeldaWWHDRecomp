@@ -1435,4 +1435,9 @@ void clear_shader_cache() {
     // Fetch parsing allocations have shared interior pointers and no owning
     // destructor in the adapted Cemu parser. Keep its process-lifetime cache.
 }
+uint64_t vertex_program_hash(const uint32_t* regs, uint64_t frame) {
+    const uint32_t address = regs[mmSQ_PGM_START_VS] << 8, size = regs[mmSQ_PGM_START_VS + 1] << 3;
+    if (!address || !size || size > 0x100000 || uint64_t(address) + size > 0x100000000ull) return 0;
+    return program_hash(address, size, frame);
+}
 } // namespace gfxvk::vk
