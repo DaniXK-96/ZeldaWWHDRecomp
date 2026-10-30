@@ -2111,10 +2111,15 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
 // also run the full resolution, compare shaders, targets, pipeline and texture/sampler bindings,
 // count and log mismatches (the draw then uses the full result). Statistics every 120 frames
 // only with WWHD_VK_STATS or verification: synchronous console writes can stall rendering.
+// WWHD_VK_FASTPATH_ORACLE=1: on every draw that registers kept from continuing, compare what the full
+// resolution gives with the state it could not continue, by exact combination of changed groups
+// ([vulkan fastpath oracle] lines with the statistics). WWHD_VK_PROF_SPLIT=1: the render profiler
+// also reports its draw phases for continued and register-broken full draws apart.
 struct FastPathConfig {
   bool on = false;
   bool stats = false;
   uint32_t verifyEvery = 0;
+  bool oracle = false, profSplit = false;
 };
 const FastPathConfig& fastpath_config() {
   static const FastPathConfig config = [] {
@@ -2123,8 +2128,13 @@ const FastPathConfig& fastpath_config() {
     const char* e = std::getenv("WWHD_VK_FASTPATH");
     c.on = e ? std::atoi(e) != 0 : true;
     if (!c.on) c.verifyEvery = 0;
-    c.stats = preparation_stats_enabled() || c.verifyEvery;
-    LOG("[vulkan] continued-draw fast path %s%s", c.on ? "on" : "off (WWHD_VK_FASTPATH=0)", c.verifyEvery ? " (verify mode)" : "");
+    const char* o = std::getenv("WWHD_VK_FASTPATH_ORACLE");
+    c.oracle = c.on && o && std::atoi(o) != 0;
+    const char* ps = std::getenv("WWHD_VK_PROF_SPLIT");
+    c.profSplit = c.on && ps && std::atoi(ps) != 0;
+    c.stats = preparation_stats_enabled() || c.verifyEvery || c.oracle;
+    LOG("[vulkan] continued-draw fast path %s%s%s%s", c.on ? "on" : "off (WWHD_VK_FASTPATH=0)", c.verifyEvery ? " (verify mode)" : "",
+        c.oracle ? " (oracle)" : "", c.profSplit ? " (profiler split)" : "");
     return c;
   }();
   return config;
@@ -2152,6 +2162,7 @@ struct DrawTargets {
   Surface* target = nullptr;  // first colour target, else depth (before AO replay drops a mismatch)
   uint32_t depthSlice = 0, width = 0, height = 0;
   float sx = 1, sy = 1;
+  uint8_t activeColors = 0;  // GetActiveColorBufferMask: it also reads the (dynamic) scissor, see continued_reason
   bool same(const DrawTargets& o) const {
     return colors == o.colors && slices == o.slices && depth == o.depth && target == o.target && depthSlice == o.depthSlice &&
            width == o.width && height == o.height && !std::memcmp(&sx, &o.sx, 4) && !std::memcmp(&sy, &o.sy, 4);
@@ -2159,11 +2170,11 @@ struct DrawTargets {
 };
 enum ContinuedReason : uint8_t {
   kContinued, kNoState, kNewFrame, kRegisters, kSurfaces, kUpload, kPrimitive, kSettings,
-  kVerifyMismatch, kNotContinuable, kAoReplay, kReasons
+  kVerifyMismatch, kNotContinuable, kAoReplay, kScissorTargets, kReasons
 };
 const char* const continuedReasonNames[kReasons] = {
   "continued", "no state", "new frame", "registers", "surfaces", "texture upload", "primitive",
-  "settings", "verify mismatch", "not continuable", "AO replay"};
+  "settings", "verify mismatch", "not continuable", "AO replay", "scissor targets"};
 struct ContinuedDraw {
   bool valid = false;
   ContinuedReason invalidReason = kNoState;  // why the state is not valid
@@ -2176,6 +2187,7 @@ struct ContinuedDraw {
   uint64_t fsKey = 0;
   vk::Shader *vs = nullptr, *ps = nullptr;
   DrawTargets targets;
+  uint32_t scissorBR = 0;  // PA_SC_GENERIC_SCISSOR_BR that targets.activeColors was resolved with
   Pipeline* pipeline = nullptr;
   ContinuedStage stages[2];
 };
@@ -2235,6 +2247,109 @@ struct ContinuedStats {
 } continuedStats;
 const char* const mismatchKindNames[8] = {"fetch shader", "vertex shader", "pixel shader", "targets",
                                           "pipeline", "texture count", "texture binding", "topology"};
+// WWHD_VK_FASTPATH_ORACLE (fastpath_config): per draw the fast path resolves in full for changed
+// registers (kRegisters), which parts of the state it could not continue the full resolution gives
+// again. Groups are accumulated per eye from every draw's take_dirty_groups (both eyes: they share
+// the register stream), so draws that return early (culled, empty) or that eye 0 took lose none.
+// "ps only by alpha test": fs and vs are the same, ps is not, and of the pixel shader key words
+// (oracle_ps_key) only SX_ALPHA_TEST_CONTROL differs.
+constexpr uint32_t kOracleKeyWords = 1 + 1 + 32 + 10 + 1 + 1 + 2 + 32 + 3 + 4 + 6 + 3 + 2 + 8 +
+                                     2 * LATTE_NUM_MAX_TEX_UNITS + 3 * LATTE_NUM_MAX_TEX_UNITS;
+using OracleKey = std::array<uint32_t, kOracleKeyWords>;
+// the words of the pixel shader key before its narrowing (shaders.cpp legacy_state_hash) and the
+// program address; word 0 is SX_ALPHA_TEST_CONTROL
+void oracle_ps_key(const uint32_t* r, OracleKey& k) {
+  uint32_t n = 0;
+  auto put = [&](uint32_t first, uint32_t count) { for (uint32_t i = 0; i < count; ++i) k[n++] = r[first + i]; };
+  put(REGADDR::SX_ALPHA_TEST_CONTROL, 1);
+  put(mmSQ_PGM_START_PS, 1);
+  put(mmSQ_VTX_SEMANTIC_0, 32); put(mmSPI_VS_OUT_ID_0, 10); put(mmSPI_VS_OUT_CONFIG, 1); put(mmPA_CL_VS_OUT_CNTL, 1);
+  put(mmSPI_PS_IN_CONTROL_0, 2); put(mmSPI_PS_INPUT_CNTL_0, 32);
+  k[n++] = r[REGADDR::VGT_PRIMITIVE_TYPE] & 0x3F;
+  k[n++] = r[mmSPI_INTERP_CONTROL_0] & (1u << 1);
+  k[n++] = r[mmVGT_STRMOUT_EN];
+  for (uint32_t b = 0; b < 4; ++b) k[n++] = r[mmVGT_STRMOUT_EN] ? r[mmVGT_STRMOUT_VTX_STRIDE_0 + b * 4] : 0;
+  put(REGADDR::VGT_GS_MODE, 1); put(REGADDR::SQ_CONFIG, 1); put(mmCB_SHADER_MASK, 1);
+  put(mmCB_SHADER_CONTROL, 1); put(mmDB_SHADER_CONTROL, 1); put(mmSPI_INPUT_Z, 1);
+  k[n++] = r[REGADDR::PA_CL_VTE_CNTL] & 0x3F;
+  k[n++] = r[REGADDR::PA_CL_CLIP_CNTL] & ((1u << 19) | (1u << 27));
+  k[n++] = r[REGADDR::DB_DEPTH_CONTROL] & 0x83;
+  put(REGADDR::CB_COLOR_CONTROL, 1); put(REGADDR::CB_TARGET_MASK, 1);
+  put(mmCB_COLOR0_INFO, 8);
+  for (uint32_t t = 0; t < LATTE_NUM_MAX_TEX_UNITS; ++t) {
+    const uint32_t* w = r + REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS + t * 7;
+    k[n++] = (w[0] & 7) | (w[4] & 0x300);
+    k[n++] = w[1] & 0x3F00000;
+  }
+  for (uint32_t t = 0; t < LATTE_NUM_MAX_TEX_UNITS * 3; ++t) k[n++] = r[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + t * 3] & 0xF8000000;
+}
+struct OracleCounts {
+  uint64_t draws = 0, fs = 0, vs = 0, ps = 0, shaders = 0, targets = 0, pipeline = 0, vsTextures = 0, psTextures = 0,
+           all = 0, psOnly = 0, psAlphaOnly = 0, psKeyEqual = 0;
+};
+struct FastPathOracle {
+  std::array<uint32_t, 2> groups{};    // per eye: groups changed since the eye's last fast-path draw
+  std::array<ContinuedDraw, 2> saved;  // per eye: the state a kRegisters draw could not continue
+  std::array<OracleKey, 2> psKey{};    // per eye: oracle_ps_key of the recorded state
+  std::unordered_map<uint32_t, OracleCounts> combos;  // by exact combination of breaking groups
+} oracle;
+bool same_stage_textures(const ContinuedStage& a, const ContinuedStage& b) {
+  if (a.count != b.count) return false;
+  for (uint32_t i = 0; i < a.count; ++i) {
+    const auto &x = a.textures[i], &y = b.textures[i];
+    if (x.unit != y.unit || x.binding != y.binding || x.surface != y.surface || x.view != y.view || x.sampler != y.sampler)
+      return false;
+  }
+  return true;
+}
+// o: the state the draw could not continue; n: what the full resolution recorded
+void oracle_count(uint32_t combo, const ContinuedDraw& o, const ContinuedDraw& n, const OracleKey& oKey, const OracleKey& nKey) {
+  auto& e = oracle.combos[combo];
+  const bool fs = o.fs == n.fs && o.fsKey == n.fsKey, vs = o.vs == n.vs, ps = o.ps == n.ps;
+  const bool targets = n.targets.same(o.targets), pipeline = o.pipeline == n.pipeline;
+  const bool vsTextures = same_stage_textures(o.stages[0], n.stages[0]), psTextures = same_stage_textures(o.stages[1], n.stages[1]);
+  ++e.draws;
+  e.fs += fs; e.vs += vs; e.ps += ps; e.shaders += fs && vs && ps;
+  e.targets += targets; e.pipeline += pipeline; e.vsTextures += vsTextures; e.psTextures += psTextures;
+  e.all += fs && vs && ps && targets && pipeline && vsTextures && psTextures;
+  if (fs && vs && !ps) {
+    ++e.psOnly;
+    const bool restEqual = std::equal(oKey.begin() + 1, oKey.end(), nKey.begin() + 1);
+    e.psAlphaOnly += restEqual && oKey[0] != nKey[0];
+    e.psKeyEqual += restEqual && oKey[0] == nKey[0];
+  }
+}
+void report_oracle(double frames) {
+  if (oracle.combos.empty()) return;
+  std::vector<std::pair<uint32_t, OracleCounts>> v(oracle.combos.begin(), oracle.combos.end());
+  oracle.combos.clear();
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+  OracleCounts t;
+  for (const auto& [combo, e] : v) {
+    t.draws += e.draws; t.fs += e.fs; t.vs += e.vs; t.ps += e.ps; t.shaders += e.shaders; t.targets += e.targets;
+    t.pipeline += e.pipeline; t.vsTextures += e.vsTextures; t.psTextures += e.psTextures; t.all += e.all;
+    t.psOnly += e.psOnly; t.psAlphaOnly += e.psAlphaOnly; t.psKeyEqual += e.psKeyEqual;
+  }
+  auto pct = [](uint64_t a, uint64_t n) { return n ? 100.0 * a / n : 0.0; };
+  LOG("[vulkan fastpath oracle] frame %llu: %.1f register draws/frame checked; same: fetch %.1f%% vs %.1f%% ps %.1f%% "
+      "fs+vs+ps %.1f%% targets %.1f%% pipeline %.1f%% vs textures %.1f%% ps textures %.1f%% all %.1f%%; only ps "
+      "differs %.1f%%, of those by alpha test only %.1f%%, with equal key words %.1f%%",
+      (unsigned long long)R.frame, t.draws / frames, pct(t.fs, t.draws), pct(t.vs, t.draws), pct(t.ps, t.draws),
+      pct(t.shaders, t.draws), pct(t.targets, t.draws), pct(t.pipeline, t.draws), pct(t.vsTextures, t.draws),
+      pct(t.psTextures, t.draws), pct(t.all, t.draws), pct(t.psOnly, t.draws), pct(t.psAlphaOnly, t.psOnly),
+      pct(t.psKeyEqual, t.psOnly));
+  for (size_t i = 0; i < v.size() && i < 12; ++i) {
+    const auto& [combo, e] = v[i];
+    std::string name;
+    for (int g = 0; g < gx2::kSgCount; ++g)
+      if (combo >> g & 1) name += (name.empty() ? "" : "+") + std::string(gx2::state_group_name(g));
+    LOG("[vulkan fastpath oracle]   %s: %.1f/frame (%.1f%%); same fs+vs+ps %.0f%% targets %.0f%% pipeline %.0f%% "
+        "vs textures %.0f%% ps textures %.0f%% all %.0f%%; only ps differs %.0f%%, of those by alpha test only %.0f%%",
+        name.empty() ? "none" : name.c_str(), e.draws / frames, pct(e.draws, t.draws), pct(e.shaders, e.draws),
+        pct(e.targets, e.draws), pct(e.pipeline, e.draws), pct(e.vsTextures, e.draws), pct(e.psTextures, e.draws),
+        pct(e.all, e.draws), pct(e.psOnly, e.draws), pct(e.psAlphaOnly, e.psOnly));
+  }
+}
 void report_continued_stats() {
   auto& st = continuedStats;
   if (R.frame < st.lastFrame + 120) return;
@@ -2256,6 +2371,7 @@ void report_continued_stats() {
                          (unsigned long long)st.totalMismatches, (unsigned long long)st.totalVerified);
     LOG("%s", buf);
   }
+  if (fastpath_config().oracle) report_oracle(frames);
   const uint64_t totalMismatches = st.totalMismatches, totalVerified = st.totalVerified;
   const auto kinds = st.mismatchKinds;
   st = {};
@@ -2274,6 +2390,7 @@ bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
   for (int i = 0; i < 8; i++)
     if (mask & (1 << i))
       t.colors[i] = color_target(r, i, &t.slices[i], claim);
+  t.activeColors = mask;
   t.depth = LatteMRT::GetActiveDepthBufferMask(lcr) ? depth_target(r, &t.depthSlice) : nullptr;
   // a lookup switched stereo eyes to full size (an unscalable format, surfaces.cpp): the targets
   // looked up before it still have the eye size; looked up again, they are rescaled
@@ -2326,18 +2443,26 @@ bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
 bool resolve_replay_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& targets) {
   struct Cached {
     uint64_t frame = ~0ull, version = 0, epoch = 0;
-    uint32_t eyeSize = 0;
+    uint32_t eyeSize = 0, scissorBR = 0;
     vk::Shader* shader = nullptr;
     DrawTargets targets;
   };
   static Cached cache;
   if (cache.frame == R.frame && cache.version == gx2::g_full_state_version &&
       cache.epoch == g_surface_epoch && cache.eyeSize == stereo_eye_size_generation() && cache.shader == ps) {
-    targets = cache.targets;
-    return true;
+    // the scissor does not bump the version but selects the active colour buffers (continued_reason)
+    const uint32_t scissorBR = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
+    if (scissorBR == cache.scissorBR ||
+        LatteMRT::GetActiveColorBufferMask(ps->dec, *reinterpret_cast<const LatteContextRegister*>(r)) ==
+            cache.targets.activeColors) {
+      cache.scissorBR = scissorBR;
+      targets = cache.targets;
+      return true;
+    }
   }
   if (!resolve_targets(r, ps, targets)) return false;
-  cache = {R.frame, gx2::g_full_state_version, g_surface_epoch, stereo_eye_size_generation(), ps, targets};
+  cache = {R.frame, gx2::g_full_state_version, g_surface_epoch, stereo_eye_size_generation(),
+           r[REGADDR::PA_SC_GENERIC_SCISSOR_BR], ps, targets};
   return true;
 }
 // A sampled texture of a stage (both paths): lookup, AO substitution and the write-tracking check.
@@ -2953,14 +3078,22 @@ bool verify_continued(const uint32_t* r, uint32_t prim) {
   }
   return false;
 }
-ContinuedReason continued_reason(uint32_t prim) {
-  const auto& c = continuedEyes[stereoEye];
+ContinuedReason continued_reason(const uint32_t* r, uint32_t prim) {
+  auto& c = continuedEyes[stereoEye];
   if (!c.valid) return c.invalidReason;
   if (c.frame != R.frame) return kNewFrame;
   if (c.stateVersion != gx2::g_full_state_version) return kRegisters;
   if (c.surfaceEpoch != g_surface_epoch) return kSurfaces;
   if (c.prim != prim) return kPrimitive;
   if (c.aoMode != ao_mode() || c.aoHires != ao_hires_enabled() || c.aniso != aniso_enabled()) return kSettings;
+  // the scissor is a continued (dynamic) word, but GetActiveColorBufferMask drops the colour buffers
+  // smaller than it: a new scissor continues only while it leaves the same targets active
+  if (r[REGADDR::PA_SC_GENERIC_SCISSOR_BR] != c.scissorBR) {
+    if (LatteMRT::GetActiveColorBufferMask(c.ps->dec, *reinterpret_cast<const LatteContextRegister*>(r)) !=
+        c.targets.activeColors)
+      return kScissorTargets;
+    c.scissorBR = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
+  }
   return kContinued;
 }
 } // namespace
@@ -3076,12 +3209,14 @@ void draw_stereo(const uint32_t *r,uint32_t prim,uint32_t count,uint32_t indexTy
 void clouds_before_draw(const uint32_t* r, const vk::Shader* ps, Surface* color0, uint32_t slice0, Surface* depth);
 bool clouds_skip_card();
 // the tall grass vertex programs (Graphics > Grass draw distance), by vk::vertex_program_hash
-// (the three of the Forest island's tall grass, 832, 1120 and 1648 bytes; logged with WWHD_VK_CULL_VS)
+// (the three of the islands' tall grass, 832, 1120 and 1648 bytes; logged with WWHD_VK_CULL_VS)
 constexpr uint64_t kGrassVs[] = {0x23CDD3D4D6BAAACDull, 0x042E089911FC3CC0ull, 0x7C8717CA596569B3ull};
 
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent) {
   const uint32_t dirtyGroups = gx2::take_dirty_groups();  // register groups changed since the previous draw
+  if (__builtin_expect(fastpath_config().oracle, 0))
+    for (auto& g : oracle.groups) g |= dirtyGroups;
   auto& continued = continuedEyes[stereoEye];
   // the top-level stereo draw only, never the AO replay below
   StereoShaders* shadersOut = std::exchange(stereoShadersOut, nullptr);
@@ -3136,7 +3271,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     }
     return e.grass;
   };
-  if ((grassDistance > 0 || !cullVs.empty()) && is_grass()) {
+  // a patch is 108 vertices; the same programs also draw the small palms and plants (216), which stay
+  if ((grassDistance > 0 || !cullVs.empty()) && uint64_t(count) * instances == 108 && is_grass()) {
     static const float envDist = [] { const char* e = std::getenv("WWHD_VK_CULL_DIST"); return e ? float(std::atof(e)) : 0.f; }();
     const float cullDist = grassDistance > 0 ? float(grassDistance) : envDist > 0 ? envDist : 6000.f;
     static uint64_t linkFrame = ~0ull;
@@ -3183,9 +3319,11 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     continued.invalidReason = kNoState;
   }
   bool fast = false;
+  bool registerBreak = false;  // resolved in full for changed registers
+  uint32_t oracleCombo = 0;    // WWHD_VK_FASTPATH_ORACLE: the breaking groups of such a draw
   if (fastPathDraw) {
     if (fastPath.stats) report_continued_stats();
-    ContinuedReason reason = continued_reason(prim);
+    ContinuedReason reason = continued_reason(r, prim);
     if (reason == kContinued) {
       // guest writes to the reused textures (write tracking, GX2Invalidate) upload here; an upload
       // can change lookups, so it ends the continuation
@@ -3202,6 +3340,15 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       }
     }
     fast = reason == kContinued;
+    registerBreak = reason == kRegisters;
+    if (fastPath.oracle) {
+      // the state this draw could not continue, before the full path below replaces it
+      if (registerBreak) {
+        oracle.saved[stereoEye] = continued;
+        oracleCombo = oracle.groups[stereoEye] & ~gx2::kSgContinuedMask;
+      }
+      oracle.groups[stereoEye] = 0;
+    }
     if (fastPath.stats) {
       ++continuedStats.draws;
       ++continuedStats.reasons[reason];
@@ -3213,6 +3360,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     continued.valid = false;
     continued.invalidReason = kNoState;
   }
+  if (fastPath.profSplit && !aoPrivateReplay)  // the AO replay draw counts in its draw's class
+    rprof::set_draw_class(fast ? rprof::kClassContinued : registerBreak ? rprof::kClassFullRegisters : rprof::kClassNone);
   uint64_t fsKey = 0;
   LatteFetchShader* fs;
   vk::Shader *vs, *ps;
@@ -3577,7 +3726,14 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       c.vs = vs;
       c.ps = ps;
       c.targets = targets;
+      c.scissorBR = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
       c.pipeline = &p;
+      if (fastPath.oracle) {
+        OracleKey key;
+        oracle_ps_key(r, key);
+        if (registerBreak) oracle_count(oracleCombo, oracle.saved[stereoEye], c, oracle.psKey[stereoEye], key);
+        oracle.psKey[stereoEye] = key;
+      }
     }
   }
   // Texture uploads, feedback copies, and sampling transitions above may have
