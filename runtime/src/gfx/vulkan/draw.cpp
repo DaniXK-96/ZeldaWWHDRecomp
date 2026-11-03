@@ -26,6 +26,7 @@
 #include "render_prof.h"
 #include "background_shaders.h"
 #include "runtime.h"
+#include "guest_addr.h"
 #include "gx2/gx2.h"
 #include "gx2/gx2_cmd.h"
 #include "shaders.h"
@@ -2111,10 +2112,25 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
 // also run the full resolution, compare shaders, targets, pipeline and texture/sampler bindings,
 // count and log mismatches (the draw then uses the full result). Statistics every 120 frames
 // only with WWHD_VK_STATS or verification: synchronous console writes can stall rendering.
+// WWHD_VK_FASTPATH_ORACLE=1: on every draw that registers kept from continuing, compare what the full
+// resolution gives with the state it could not continue, by exact combination of changed groups
+// ([vulkan fastpath oracle] lines with the statistics). WWHD_VK_PROF_SPLIT=1: the render profiler
+// also reports its draw phases for continued and register-broken full draws apart.
+// WWHD_VK_FASTPATH_PARTIAL=1 (off by default): partial continuation. A draw that registers kept from
+// continuing resolves its fetch/vertex/pixel shaders as a full draw does; when they are the state's
+// own, it reuses the state's render targets, pipeline and each stage's texture/sampler bindings
+// whose inputs did not change (gx2/state_groups.h kSgPartial*Mask, from the register groups changed
+// since the state was recorded) and resolves the rest; any other difference (another frame, surface
+// epoch, primitive, settings, an "other" register group) resolves in full. Reused textures still go
+// through upload_surface first, and a stage is reused only while the surface epoch is the state's.
+// The draw records its state as a full one does. With WWHD_VK_FASTPATH_VERIFY=N, every Nth partial
+// draw also runs the full resolution against everything it recorded (a mismatch is logged and ends
+// the continuation; that draw has already used the state).
 struct FastPathConfig {
   bool on = false;
   bool stats = false;
   uint32_t verifyEvery = 0;
+  bool oracle = false, profSplit = false, partial = false;
 };
 const FastPathConfig& fastpath_config() {
   static const FastPathConfig config = [] {
@@ -2123,8 +2139,15 @@ const FastPathConfig& fastpath_config() {
     const char* e = std::getenv("WWHD_VK_FASTPATH");
     c.on = e ? std::atoi(e) != 0 : true;
     if (!c.on) c.verifyEvery = 0;
-    c.stats = preparation_stats_enabled() || c.verifyEvery;
-    LOG("[vulkan] continued-draw fast path %s%s", c.on ? "on" : "off (WWHD_VK_FASTPATH=0)", c.verifyEvery ? " (verify mode)" : "");
+    const char* o = std::getenv("WWHD_VK_FASTPATH_ORACLE");
+    c.oracle = c.on && o && std::atoi(o) != 0;
+    const char* ps = std::getenv("WWHD_VK_PROF_SPLIT");
+    c.profSplit = c.on && ps && std::atoi(ps) != 0;
+    const char* pa = std::getenv("WWHD_VK_FASTPATH_PARTIAL");
+    c.partial = c.on && pa && std::atoi(pa) != 0;
+    c.stats = preparation_stats_enabled() || c.verifyEvery || c.oracle;
+    LOG("[vulkan] continued-draw fast path %s%s%s%s%s", c.on ? "on" : "off (WWHD_VK_FASTPATH=0)", c.verifyEvery ? " (verify mode)" : "",
+        c.oracle ? " (oracle)" : "", c.profSplit ? " (profiler split)" : "", c.partial ? " (partial continuation)" : "");
     return c;
   }();
   return config;
@@ -2152,6 +2175,7 @@ struct DrawTargets {
   Surface* target = nullptr;  // first colour target, else depth (before AO replay drops a mismatch)
   uint32_t depthSlice = 0, width = 0, height = 0;
   float sx = 1, sy = 1;
+  uint8_t activeColors = 0;  // GetActiveColorBufferMask: it also reads the (dynamic) scissor, see continued_reason
   bool same(const DrawTargets& o) const {
     return colors == o.colors && slices == o.slices && depth == o.depth && target == o.target && depthSlice == o.depthSlice &&
            width == o.width && height == o.height && !std::memcmp(&sx, &o.sx, 4) && !std::memcmp(&sy, &o.sy, 4);
@@ -2159,11 +2183,11 @@ struct DrawTargets {
 };
 enum ContinuedReason : uint8_t {
   kContinued, kNoState, kNewFrame, kRegisters, kSurfaces, kUpload, kPrimitive, kSettings,
-  kVerifyMismatch, kNotContinuable, kAoReplay, kReasons
+  kVerifyMismatch, kNotContinuable, kAoReplay, kScissorTargets, kReasons
 };
 const char* const continuedReasonNames[kReasons] = {
   "continued", "no state", "new frame", "registers", "surfaces", "texture upload", "primitive",
-  "settings", "verify mismatch", "not continuable", "AO replay"};
+  "settings", "verify mismatch", "not continuable", "AO replay", "scissor targets"};
 struct ContinuedDraw {
   bool valid = false;
   ContinuedReason invalidReason = kNoState;  // why the state is not valid
@@ -2176,11 +2200,16 @@ struct ContinuedDraw {
   uint64_t fsKey = 0;
   vk::Shader *vs = nullptr, *ps = nullptr;
   DrawTargets targets;
+  uint32_t scissorBR = 0;  // PA_SC_GENERIC_SCISSOR_BR that targets.activeColors was resolved with
   Pipeline* pipeline = nullptr;
   ContinuedStage stages[2];
 };
 // Stereo: each eye's command stream continues its own previous draw (stereo.h).
 std::array<ContinuedDraw, 2> continuedEyes;
+// WWHD_VK_FASTPATH_PARTIAL: per eye, the register groups changed since the eye's state was recorded.
+// Every draw's take_dirty_groups goes to both eyes (they share the register stream) before any early
+// return, so neither a culled or empty draw nor eye 0 taking the changes loses a group.
+std::array<uint32_t, 2> partialGroups{};
 // Stereo: eye 1 draws the same guest operation right after eye 0 (draw_stereo), with the same
 // registers, so it takes eye 0's fetch, vertex and pixel shaders instead of looking them up again.
 // When eye 0's draw completed in the same submission, eye 1 also replays its index and vertex
@@ -2229,12 +2258,119 @@ StereoShaders* stereoShadersOut = nullptr;       // eye 0's draw records
 const StereoShaders* stereoShadersIn = nullptr;  // eye 1's draw reuses
 struct ContinuedStats {
   uint64_t lastFrame = 0, draws = 0, verified = 0, mismatches = 0, totalMismatches = 0, totalVerified = 0;
+  // WWHD_VK_FASTPATH_PARTIAL: register draws that could continue in part, those with the state's
+  // shaders, and of those the pieces reused
+  uint64_t partialCandidates = 0, partial = 0, partialTargets = 0, partialPipeline = 0;
+  std::array<uint64_t, 2> partialStages{};
   std::array<uint64_t, kReasons> reasons{};
   std::array<uint64_t, gx2::kSgCount> groups{};  // register groups that ended a continuation
   std::array<uint64_t, 8> mismatchKinds{};
 } continuedStats;
 const char* const mismatchKindNames[8] = {"fetch shader", "vertex shader", "pixel shader", "targets",
                                           "pipeline", "texture count", "texture binding", "topology"};
+// WWHD_VK_FASTPATH_ORACLE (fastpath_config): per draw the fast path resolves in full for changed
+// registers (kRegisters), which parts of the state it could not continue the full resolution gives
+// again. Groups are accumulated per eye from every draw's take_dirty_groups (both eyes: they share
+// the register stream), so draws that return early (culled, empty) or that eye 0 took lose none.
+// "ps only by alpha test": fs and vs are the same, ps is not, and of the pixel shader key words
+// (oracle_ps_key) only SX_ALPHA_TEST_CONTROL differs.
+constexpr uint32_t kOracleKeyWords = 1 + 1 + 32 + 10 + 1 + 1 + 2 + 32 + 3 + 4 + 6 + 3 + 2 + 8 +
+                                     2 * LATTE_NUM_MAX_TEX_UNITS + 3 * LATTE_NUM_MAX_TEX_UNITS;
+using OracleKey = std::array<uint32_t, kOracleKeyWords>;
+// the words of the pixel shader key before its narrowing (shaders.cpp legacy_state_hash) and the
+// program address; word 0 is SX_ALPHA_TEST_CONTROL
+void oracle_ps_key(const uint32_t* r, OracleKey& k) {
+  uint32_t n = 0;
+  auto put = [&](uint32_t first, uint32_t count) { for (uint32_t i = 0; i < count; ++i) k[n++] = r[first + i]; };
+  put(REGADDR::SX_ALPHA_TEST_CONTROL, 1);
+  put(mmSQ_PGM_START_PS, 1);
+  put(mmSQ_VTX_SEMANTIC_0, 32); put(mmSPI_VS_OUT_ID_0, 10); put(mmSPI_VS_OUT_CONFIG, 1); put(mmPA_CL_VS_OUT_CNTL, 1);
+  put(mmSPI_PS_IN_CONTROL_0, 2); put(mmSPI_PS_INPUT_CNTL_0, 32);
+  k[n++] = r[REGADDR::VGT_PRIMITIVE_TYPE] & 0x3F;
+  k[n++] = r[mmSPI_INTERP_CONTROL_0] & (1u << 1);
+  k[n++] = r[mmVGT_STRMOUT_EN];
+  for (uint32_t b = 0; b < 4; ++b) k[n++] = r[mmVGT_STRMOUT_EN] ? r[mmVGT_STRMOUT_VTX_STRIDE_0 + b * 4] : 0;
+  put(REGADDR::VGT_GS_MODE, 1); put(REGADDR::SQ_CONFIG, 1); put(mmCB_SHADER_MASK, 1);
+  put(mmCB_SHADER_CONTROL, 1); put(mmDB_SHADER_CONTROL, 1); put(mmSPI_INPUT_Z, 1);
+  k[n++] = r[REGADDR::PA_CL_VTE_CNTL] & 0x3F;
+  k[n++] = r[REGADDR::PA_CL_CLIP_CNTL] & ((1u << 19) | (1u << 27));
+  k[n++] = r[REGADDR::DB_DEPTH_CONTROL] & 0x83;
+  put(REGADDR::CB_COLOR_CONTROL, 1); put(REGADDR::CB_TARGET_MASK, 1);
+  put(mmCB_COLOR0_INFO, 8);
+  for (uint32_t t = 0; t < LATTE_NUM_MAX_TEX_UNITS; ++t) {
+    const uint32_t* w = r + REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS + t * 7;
+    k[n++] = (w[0] & 7) | (w[4] & 0x300);
+    k[n++] = w[1] & 0x3F00000;
+  }
+  for (uint32_t t = 0; t < LATTE_NUM_MAX_TEX_UNITS * 3; ++t) k[n++] = r[REGADDR::SQ_TEX_SAMPLER_WORD0_0 + t * 3] & 0xF8000000;
+}
+struct OracleCounts {
+  uint64_t draws = 0, fs = 0, vs = 0, ps = 0, shaders = 0, targets = 0, pipeline = 0, vsTextures = 0, psTextures = 0,
+           all = 0, psOnly = 0, psAlphaOnly = 0, psKeyEqual = 0;
+};
+struct FastPathOracle {
+  std::array<uint32_t, 2> groups{};    // per eye: groups changed since the eye's last fast-path draw
+  std::array<ContinuedDraw, 2> saved;  // per eye: the state a kRegisters draw could not continue
+  std::array<OracleKey, 2> psKey{};    // per eye: oracle_ps_key of the recorded state
+  std::unordered_map<uint32_t, OracleCounts> combos;  // by exact combination of breaking groups
+} oracle;
+bool same_stage_textures(const ContinuedStage& a, const ContinuedStage& b) {
+  if (a.count != b.count) return false;
+  for (uint32_t i = 0; i < a.count; ++i) {
+    const auto &x = a.textures[i], &y = b.textures[i];
+    if (x.unit != y.unit || x.binding != y.binding || x.surface != y.surface || x.view != y.view || x.sampler != y.sampler)
+      return false;
+  }
+  return true;
+}
+// o: the state the draw could not continue; n: what the full resolution recorded
+void oracle_count(uint32_t combo, const ContinuedDraw& o, const ContinuedDraw& n, const OracleKey& oKey, const OracleKey& nKey) {
+  auto& e = oracle.combos[combo];
+  const bool fs = o.fs == n.fs && o.fsKey == n.fsKey, vs = o.vs == n.vs, ps = o.ps == n.ps;
+  const bool targets = n.targets.same(o.targets), pipeline = o.pipeline == n.pipeline;
+  const bool vsTextures = same_stage_textures(o.stages[0], n.stages[0]), psTextures = same_stage_textures(o.stages[1], n.stages[1]);
+  ++e.draws;
+  e.fs += fs; e.vs += vs; e.ps += ps; e.shaders += fs && vs && ps;
+  e.targets += targets; e.pipeline += pipeline; e.vsTextures += vsTextures; e.psTextures += psTextures;
+  e.all += fs && vs && ps && targets && pipeline && vsTextures && psTextures;
+  if (fs && vs && !ps) {
+    ++e.psOnly;
+    const bool restEqual = std::equal(oKey.begin() + 1, oKey.end(), nKey.begin() + 1);
+    e.psAlphaOnly += restEqual && oKey[0] != nKey[0];
+    e.psKeyEqual += restEqual && oKey[0] == nKey[0];
+  }
+}
+void report_oracle(double frames) {
+  if (oracle.combos.empty()) return;
+  std::vector<std::pair<uint32_t, OracleCounts>> v(oracle.combos.begin(), oracle.combos.end());
+  oracle.combos.clear();
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+  OracleCounts t;
+  for (const auto& [combo, e] : v) {
+    t.draws += e.draws; t.fs += e.fs; t.vs += e.vs; t.ps += e.ps; t.shaders += e.shaders; t.targets += e.targets;
+    t.pipeline += e.pipeline; t.vsTextures += e.vsTextures; t.psTextures += e.psTextures; t.all += e.all;
+    t.psOnly += e.psOnly; t.psAlphaOnly += e.psAlphaOnly; t.psKeyEqual += e.psKeyEqual;
+  }
+  auto pct = [](uint64_t a, uint64_t n) { return n ? 100.0 * a / n : 0.0; };
+  LOG("[vulkan fastpath oracle] frame %llu: %.1f register draws/frame checked; same: fetch %.1f%% vs %.1f%% ps %.1f%% "
+      "fs+vs+ps %.1f%% targets %.1f%% pipeline %.1f%% vs textures %.1f%% ps textures %.1f%% all %.1f%%; only ps "
+      "differs %.1f%%, of those by alpha test only %.1f%%, with equal key words %.1f%%",
+      (unsigned long long)R.frame, t.draws / frames, pct(t.fs, t.draws), pct(t.vs, t.draws), pct(t.ps, t.draws),
+      pct(t.shaders, t.draws), pct(t.targets, t.draws), pct(t.pipeline, t.draws), pct(t.vsTextures, t.draws),
+      pct(t.psTextures, t.draws), pct(t.all, t.draws), pct(t.psOnly, t.draws), pct(t.psAlphaOnly, t.psOnly),
+      pct(t.psKeyEqual, t.psOnly));
+  for (size_t i = 0; i < v.size() && i < 12; ++i) {
+    const auto& [combo, e] = v[i];
+    std::string name;
+    for (int g = 0; g < gx2::kSgCount; ++g)
+      if (combo >> g & 1) name += (name.empty() ? "" : "+") + std::string(gx2::state_group_name(g));
+    LOG("[vulkan fastpath oracle]   %s: %.1f/frame (%.1f%%); same fs+vs+ps %.0f%% targets %.0f%% pipeline %.0f%% "
+        "vs textures %.0f%% ps textures %.0f%% all %.0f%%; only ps differs %.0f%%, of those by alpha test only %.0f%%",
+        name.empty() ? "none" : name.c_str(), e.draws / frames, pct(e.draws, t.draws), pct(e.shaders, e.draws),
+        pct(e.targets, e.draws), pct(e.pipeline, e.draws), pct(e.vsTextures, e.draws), pct(e.psTextures, e.draws),
+        pct(e.all, e.draws), pct(e.psOnly, e.draws), pct(e.psAlphaOnly, e.psOnly));
+  }
+}
 void report_continued_stats() {
   auto& st = continuedStats;
   if (R.frame < st.lastFrame + 120) return;
@@ -2250,12 +2386,21 @@ void report_continued_stats() {
       for (int g = 0; g < gx2::kSgCount && k < int(sizeof buf); ++g)
         if (st.groups[g]) k += std::snprintf(buf + k, sizeof buf - k, " %s %.0f", gx2::state_group_name(g), st.groups[g] / frames);
     }
+    if (fastpath_config().partial && k < int(sizeof buf)) {
+      auto pct = [&](uint64_t a) { return st.partial ? 100.0 * a / st.partial : 0.0; };
+      k += std::snprintf(buf + k, sizeof buf - k,
+                         "; partial: %.1f/frame of %.1f candidates (reused targets %.0f%% pipeline %.0f%% "
+                         "vs textures %.0f%% ps textures %.0f%%)",
+                         st.partial / frames, st.partialCandidates / frames, pct(st.partialTargets),
+                         pct(st.partialPipeline), pct(st.partialStages[0]), pct(st.partialStages[1]));
+    }
     if (fastpath_config().verifyEvery && k < int(sizeof buf))
       k += std::snprintf(buf + k, sizeof buf - k, "; verify: %llu checked, %llu mismatches (total %llu of %llu)",
                          (unsigned long long)st.verified, (unsigned long long)st.mismatches,
                          (unsigned long long)st.totalMismatches, (unsigned long long)st.totalVerified);
     LOG("%s", buf);
   }
+  if (fastpath_config().oracle) report_oracle(frames);
   const uint64_t totalMismatches = st.totalMismatches, totalVerified = st.totalVerified;
   const auto kinds = st.mismatchKinds;
   st = {};
@@ -2274,6 +2419,7 @@ bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
   for (int i = 0; i < 8; i++)
     if (mask & (1 << i))
       t.colors[i] = color_target(r, i, &t.slices[i], claim);
+  t.activeColors = mask;
   t.depth = LatteMRT::GetActiveDepthBufferMask(lcr) ? depth_target(r, &t.depthSlice) : nullptr;
   // a lookup switched stereo eyes to full size (an unscalable format, surfaces.cpp): the targets
   // looked up before it still have the eye size; looked up again, they are rescaled
@@ -2326,18 +2472,26 @@ bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
 bool resolve_replay_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& targets) {
   struct Cached {
     uint64_t frame = ~0ull, version = 0, epoch = 0;
-    uint32_t eyeSize = 0;
+    uint32_t eyeSize = 0, scissorBR = 0;
     vk::Shader* shader = nullptr;
     DrawTargets targets;
   };
   static Cached cache;
   if (cache.frame == R.frame && cache.version == gx2::g_full_state_version &&
       cache.epoch == g_surface_epoch && cache.eyeSize == stereo_eye_size_generation() && cache.shader == ps) {
-    targets = cache.targets;
-    return true;
+    // the scissor does not bump the version but selects the active colour buffers (continued_reason)
+    const uint32_t scissorBR = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
+    if (scissorBR == cache.scissorBR ||
+        LatteMRT::GetActiveColorBufferMask(ps->dec, *reinterpret_cast<const LatteContextRegister*>(r)) ==
+            cache.targets.activeColors) {
+      cache.scissorBR = scissorBR;
+      targets = cache.targets;
+      return true;
+    }
   }
   if (!resolve_targets(r, ps, targets)) return false;
-  cache = {R.frame, gx2::g_full_state_version, g_surface_epoch, stereo_eye_size_generation(), ps, targets};
+  cache = {R.frame, gx2::g_full_state_version, g_surface_epoch, stereo_eye_size_generation(),
+           r[REGADDR::PA_SC_GENERIC_SCISSOR_BR], ps, targets};
   return true;
 }
 // A sampled texture of a stage (both paths): lookup, AO substitution and the write-tracking check.
@@ -2895,7 +3049,9 @@ bool replay_stage(const StageReplay& in, const uint32_t* r, vk::Shader* sh, floa
   return true;
 }
 // WWHD_VK_FASTPATH_VERIFY: the full resolution of a continued draw, compared with the reused state
-bool verify_continued(const uint32_t* r, uint32_t prim) {
+// (partial: of a partial continuation, compared with the state it recorded)
+// textures=false: shaders, topology, targets and pipeline only (a partial draw whose new stage cannot continue)
+bool verify_continued(const uint32_t* r, uint32_t prim, bool partial = false, bool textures = true) {
   const auto& c = continuedEyes[stereoEye];
   int kind = -1;
   char detail[200] = "";
@@ -2911,7 +3067,7 @@ bool verify_continued(const uint32_t* r, uint32_t prim) {
   else if (primitive_topology(prim) != c.topology) kind = 7;
   else if (!resolve_targets(r, ps, t) || !t.same(c.targets)) kind = 3;
   else if (&pipeline(r, vs, ps, fs, c.topology, t.colors, t.depth) != c.pipeline) kind = 4;
-  else
+  else if (textures)
     for (int stage = 0; stage < 2 && kind < 0; ++stage) {
       vk::Shader* sh = stage ? ps : vs;
       const auto& cs = c.stages[stage];
@@ -2946,22 +3102,40 @@ bool verify_continued(const uint32_t* r, uint32_t prim) {
   static int logged = 0;
   if (logged < 50) {
     ++logged;
-    LOG("[vulkan fastpath] verify mismatch #%llu: %s%s; frame %llu draw %llu prim %u vs %08X ps %08X fs %08X",
-        (unsigned long long)st.totalMismatches, mismatchKindNames[kind], detail, (unsigned long long)R.frame,
+    LOG("[vulkan fastpath] verify mismatch #%llu%s: %s%s; frame %llu draw %llu prim %u vs %08X ps %08X fs %08X",
+        (unsigned long long)st.totalMismatches, partial ? " (partial continuation)" : "", mismatchKindNames[kind], detail,
+        (unsigned long long)R.frame,
         (unsigned long long)R.drawCount, prim, r[mmSQ_PGM_START_VS] << 8, r[mmSQ_PGM_START_PS] << 8,
         r[mmSQ_PGM_START_FS] << 8);
   }
   return false;
 }
-ContinuedReason continued_reason(uint32_t prim) {
-  const auto& c = continuedEyes[stereoEye];
+ContinuedReason continued_reason(const uint32_t* r, uint32_t prim) {
+  auto& c = continuedEyes[stereoEye];
   if (!c.valid) return c.invalidReason;
   if (c.frame != R.frame) return kNewFrame;
   if (c.stateVersion != gx2::g_full_state_version) return kRegisters;
   if (c.surfaceEpoch != g_surface_epoch) return kSurfaces;
   if (c.prim != prim) return kPrimitive;
   if (c.aoMode != ao_mode() || c.aoHires != ao_hires_enabled() || c.aniso != aniso_enabled()) return kSettings;
+  // the scissor is a continued (dynamic) word, but GetActiveColorBufferMask drops the colour buffers
+  // smaller than it: a new scissor continues only while it leaves the same targets active
+  if (r[REGADDR::PA_SC_GENERIC_SCISSOR_BR] != c.scissorBR) {
+    if (LatteMRT::GetActiveColorBufferMask(c.ps->dec, *reinterpret_cast<const LatteContextRegister*>(r)) !=
+        c.targets.activeColors)
+      return kScissorTargets;
+    c.scissorBR = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
+  }
   return kContinued;
+}
+// WWHD_VK_FASTPATH_PARTIAL: a draw that registers kept from continuing (kRegisters: the state is
+// valid and of this frame) may reuse pieces of the state: everything else continued_reason checks
+// holds, and no register outside the known groups changed
+bool partial_candidate(uint32_t prim) {
+  const auto& c = continuedEyes[stereoEye];
+  return c.surfaceEpoch == g_surface_epoch && c.prim == prim && c.aoMode == ao_mode() &&
+         c.aoHires == ao_hires_enabled() && c.aniso == aniso_enabled() && c.pipeline &&
+         !(partialGroups[stereoEye] >> gx2::kSgOther & 1);
 }
 } // namespace
 // Sizing (WWHD_VK_MEMORY_LOG_FRAMES): the game's pipelines (never freed), those still compiling (each holds its two
@@ -3075,9 +3249,17 @@ void draw_stereo(const uint32_t *r,uint32_t prim,uint32_t count,uint32_t indexTy
 }
 void clouds_before_draw(const uint32_t* r, const vk::Shader* ps, Surface* color0, uint32_t slice0, Surface* depth);
 bool clouds_skip_card();
+// the tall grass vertex programs (Graphics > Grass draw distance), by vk::vertex_program_hash
+// (the three of the islands' tall grass, 832, 1120 and 1648 bytes; logged with WWHD_VK_CULL_VS)
+constexpr uint64_t kGrassVs[] = {0x23CDD3D4D6BAAACDull, 0x042E089911FC3CC0ull, 0x7C8717CA596569B3ull};
+
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent) {
   const uint32_t dirtyGroups = gx2::take_dirty_groups();  // register groups changed since the previous draw
+  if (__builtin_expect(fastpath_config().oracle, 0))
+    for (auto& g : oracle.groups) g |= dirtyGroups;
+  if (__builtin_expect(fastpath_config().partial, 0))
+    for (auto& g : partialGroups) g |= dirtyGroups;
   auto& continued = continuedEyes[stereoEye];
   // the top-level stereo draw only, never the AO replay below
   StereoShaders* shadersOut = std::exchange(stereoShadersOut, nullptr);
@@ -3091,6 +3273,86 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
     return;
   ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
+  // Graphics > Grass draw distance (render::grass_distance): drop (before any resolution) the tall grass patches whose
+  // model translation (vertex uniform block 1, a 3x4 row-major matrix) lies farther than that from Link (horizontal).
+  // The grass is told by its vertex program's bytes (kGrassVs; WWHD_GRASS_VS_HASH=HASH,... replaces the list);
+  // WWHD_VK_CULL_VS=ADDR,... picks programs by address instead and logs their hashes.
+  static const std::vector<uint64_t> grassVs = [] {
+    std::vector<uint64_t> v = {kGrassVs, kGrassVs + std::size(kGrassVs)};
+    if (const char* e = std::getenv("WWHD_GRASS_VS_HASH")) {
+      v.clear();
+      for (const char* p = e; *p;) { v.push_back(std::strtoull(p, const_cast<char**>(&p), 16)); while (*p == ',') ++p; }
+    }
+    return v;
+  }();
+  static const std::vector<uint32_t> cullVs = [] {
+    std::vector<uint32_t> v;
+    if (const char* e = std::getenv("WWHD_VK_CULL_VS"))
+      for (const char* p = e; *p;) { v.push_back(uint32_t(std::strtoul(p, const_cast<char**>(&p), 16))); while (*p == ',') ++p; }
+    return v;
+  }();
+  const int grassDistance = render::grass_distance();
+  auto is_grass = [&] {
+    const uint32_t vsAddr = r[mmSQ_PGM_START_VS] << 8;
+    if (!cullVs.empty()) {
+      const bool hit = std::find(cullVs.begin(), cullVs.end(), vsAddr) != cullVs.end();
+      static std::unordered_map<uint32_t, uint64_t> logged;
+      if (hit && !logged.count(vsAddr)) {
+        logged[vsAddr] = vk::vertex_program_hash(r, R.frame);
+        LOG("[grass] VS %08X (%u bytes): hash %016llX", vsAddr, r[mmSQ_PGM_START_VS + 1] << 3, (unsigned long long)logged[vsAddr]);
+      }
+      return hit;
+    }
+    // a few programs a frame: their answer is kept for the frame (program_hash revalidates once per frame)
+    struct Seen { uint32_t addr = 0, size = 0; uint64_t frame = ~0ull; bool grass = false; };
+    static Seen seen[8];
+    const uint32_t size = r[mmSQ_PGM_START_VS + 1];
+    Seen& e = seen[(vsAddr >> 8) & 7];
+    if (e.frame != R.frame || e.addr != vsAddr || e.size != size) {
+      const uint64_t h = vk::vertex_program_hash(r, R.frame);
+      e = {vsAddr, size, R.frame, h && std::find(grassVs.begin(), grassVs.end(), h) != grassVs.end()};
+    }
+    return e.grass;
+  };
+  // a patch is 108 vertices; the same programs also draw the small palms and plants (216), which stay
+  if ((grassDistance > 0 || !cullVs.empty()) && uint64_t(count) * instances == 108 && is_grass()) {
+    static const float envDist = [] { const char* e = std::getenv("WWHD_VK_CULL_DIST"); return e ? float(std::atof(e)) : 0.f; }();
+    const float cullDist = grassDistance > 0 ? float(grassDistance) : envDist > 0 ? envDist : 6000.f;
+    static uint64_t linkFrame = ~0ull;
+    static bool haveLink = false;
+    static float lx = 0, lz = 0;
+    static uint64_t culled = 0, kept = 0;
+    auto be32 = [](uint32_t a) { uint32_t v; std::memcpy(&v, mem::ptr(a), 4); return __builtin_bswap32(v); };
+    auto bef = [&](uint32_t a) { const uint32_t v = be32(a); float f; std::memcpy(&f, &v, 4); return f; };
+    auto valid = [](uint32_t a) { return a >= 0x10000000u && a < 0x60000000u && !(a & 3); };
+    if (linkFrame != R.frame) {  // Link: the actor queue's process 0xA8 (herramientas/lector.py)
+      linkFrame = R.frame;
+      haveLink = false;
+      uint32_t n = be32(GD(0x101F3328));  // g_fopAcTg_Queue (touch_talk.cpp), mapped for this build
+      for (int i = 0; i < 4096 && n && valid(n); ++i) {
+        const uint32_t a = be32(n + 0xC);
+        if (valid(a) && (be32(a + 8) >> 16) == 0xA8) { lx = bef(a + 0x314); lz = bef(a + 0x31C); haveLink = true; break; }
+        n = be32(n + 8);
+      }
+      if (R.frame % 600 == 0 && culled + kept)
+        LOG("[cull] frame %llu: %.1f%% of the selected draws culled (Link %s %.0f %.0f)", (unsigned long long)R.frame,
+            100.0 * culled / (culled + kept), haveLink ? "at" : "not found", lx, lz);
+      if (R.frame % 600 == 0) culled = kept = 0;
+    }
+    const uint32_t addr = r[mmSQ_VTX_UNIFORM_BLOCK_START + 7], size = r[mmSQ_VTX_UNIFORM_BLOCK_START + 8] + 1;
+    if (haveLink && addr && size >= 48) {
+      float m[12];
+      std::memcpy(m, mem::ptr(addr), sizeof m);  // uploaded as is (uniform())
+      const float dx = m[3] - lx, dz = m[11] - lz;
+      if (dx * dx + dz * dz > cullDist * cullDist) {
+        // the next draw continues from the previous drawn one: keep this draw's register changes
+        gx2::g_dirty_groups |= dirtyGroups;
+        ++culled;
+        return;
+      }
+    }
+    ++kept;
+  }
   // continued-draw fast path (see fastpath_config); the AO replay draw stays outside of it
   const auto& fastPath = fastpath_config();
   // a replayed eye 1 draw records no continuation of its own
@@ -3100,9 +3362,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     continued.invalidReason = kNoState;
   }
   bool fast = false;
+  bool registerBreak = false;  // resolved in full for changed registers
+  bool partialCandidate = false;  // WWHD_VK_FASTPATH_PARTIAL: such a draw may reuse pieces of the state
+  uint32_t oracleCombo = 0;    // WWHD_VK_FASTPATH_ORACLE: the breaking groups of such a draw
   if (fastPathDraw) {
     if (fastPath.stats) report_continued_stats();
-    ContinuedReason reason = continued_reason(prim);
+    ContinuedReason reason = continued_reason(r, prim);
     if (reason == kContinued) {
       // guest writes to the reused textures (write tracking, GX2Invalidate) upload here; an upload
       // can change lookups, so it ends the continuation
@@ -3119,6 +3384,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       }
     }
     fast = reason == kContinued;
+    registerBreak = reason == kRegisters;
+    partialCandidate = fastPath.partial && registerBreak && partial_candidate(prim);
+    continuedStats.partialCandidates += partialCandidate;
+    if (fastPath.oracle) {
+      // the state this draw could not continue, before the full path below replaces it
+      if (registerBreak) {
+        oracle.saved[stereoEye] = continued;
+        oracleCombo = oracle.groups[stereoEye] & ~gx2::kSgContinuedMask;
+      }
+      oracle.groups[stereoEye] = 0;
+    }
     if (fastPath.stats) {
       ++continuedStats.draws;
       ++continuedStats.reasons[reason];
@@ -3130,6 +3406,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     continued.valid = false;
     continued.invalidReason = kNoState;
   }
+  if (fastPath.profSplit && !aoPrivateReplay)  // the AO replay draw counts in its draw's class
+    rprof::set_draw_class(fast ? rprof::kClassContinued : registerBreak ? rprof::kClassFullRegisters : rprof::kClassNone);
   uint64_t fsKey = 0;
   LatteFetchShader* fs;
   vk::Shader *vs, *ps;
@@ -3163,7 +3441,78 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen,
                            vs && vs->ready() ? vs : nullptr);
   }
+  // WWHD_VK_FASTPATH_PARTIAL: the state's own shaders (the state's fields stay as recorded until this
+  // draw records its own); partialChanged: the breaking groups changed since it was recorded
+  const bool partial = partialCandidate && fs == continued.fs && fsKey == continued.fsKey && vs == continued.vs &&
+                       ps == continued.ps && vs && vs->ready() && ps && ps->ready();
+  const uint32_t partialChanged = partial ? partialGroups[stereoEye] & ~gx2::kSgContinuedMask : 0;
   rprof::mark(rprof::kShader);
+  // WWHD_VK_DRAW_CENSUS=N: every N frames, log the vertex/pixel programs with the most draws (and
+  // their first pixel texture) since the previous report
+  static const uint32_t censusEvery = [] {
+    const char* e = std::getenv("WWHD_VK_DRAW_CENSUS");
+    return e ? uint32_t(std::max(0, std::atoi(e))) : 0u;
+  }();
+  if (censusEvery && !replay && !aoPrivateReplay) {
+    struct CensusEntry { uint64_t draws = 0, fast = 0, vertices = 0; uint32_t texture = 0; };
+    static std::unordered_map<uint64_t, CensusEntry> census;
+    static uint64_t censusFrame = R.frame, censusDraws = 0;
+    const uint64_t key = uint64_t(r[mmSQ_PGM_START_VS]) << 32 | r[mmSQ_PGM_START_PS];
+    auto& e = census[key];
+    ++e.draws; e.fast += fast; e.vertices += uint64_t(count) * instances; ++censusDraws;
+    if (!e.texture) e.texture = r[REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS + 2] << 8;
+    if (R.frame >= censusFrame + censusEvery) {
+      std::vector<std::pair<uint64_t, CensusEntry>> top(census.begin(), census.end());
+      std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.draws > b.second.draws; });
+      const double frames = double(R.frame - censusFrame);
+      LOG("[census] frame %llu: %.0f draws/frame, %zu program pairs", (unsigned long long)R.frame, censusDraws / frames, census.size());
+      for (size_t i = 0; i < top.size() && i < 16; ++i) {
+        const auto& [k, c] = top[i];
+        LOG("[census]   VS %08X PS %08X  %7.1f draws/frame (%4.1f%%, %3.0f%% continued) %6.1f verts/draw tex %08X",
+            uint32_t(k >> 32) << 8, uint32_t(k) << 8, c.draws / frames, 100.0 * c.draws / censusDraws,
+            100.0 * c.fast / c.draws, double(c.vertices) / c.draws, c.texture);
+      }
+      census.clear(); censusDraws = 0; censusFrame = R.frame;
+    }
+  }
+  // WWHD_VK_SKIP_VS=ADDR,ADDR...: drop the draws of these vertex programs (diagnosis);
+  // WWHD_VK_DUMP_VS=ADDR: log the vertex stage constants of a few of its draws
+  static const std::vector<uint32_t> skipVs = [] {
+    std::vector<uint32_t> v;
+    if (const char* e = std::getenv("WWHD_VK_SKIP_VS"))
+      for (const char* p = e; *p;) { v.push_back(uint32_t(std::strtoul(p, const_cast<char**>(&p), 16))); while (*p == ',') ++p; }
+    return v;
+  }();
+  static const uint32_t dumpVs = [] { const char* e = std::getenv("WWHD_VK_DUMP_VS"); return e ? uint32_t(std::strtoul(e, nullptr, 16)) : 0u; }();
+  const uint32_t vsAddress = r[mmSQ_PGM_START_VS] << 8;
+  if (dumpVs == vsAddress && !replay) {
+    static uint32_t dumped = 0;
+    if (dumped < 24 && R.frame > 900 && R.frame % 300 == 0) {
+      ++dumped;
+      auto f = [](uint32_t v) { float x; std::memcpy(&x, &v, 4); return x; };
+      const uint32_t* alu = r + mmSQ_ALU_CONSTANT0_0 + 0x400;
+      std::string s;
+      char b[64];
+      for (int i = 0; i < 64; ++i) { std::snprintf(b, sizeof b, "%s%.3f", i % 4 ? " " : " | ", f(alu[i])); s += b; }
+      LOG("[dumpvs] frame %llu alu0..15:%s", (unsigned long long)R.frame, s.c_str());
+      const uint32_t* alu0 = r + mmSQ_ALU_CONSTANT0_0;
+      s.clear();
+      for (int i = 0; i < 64; ++i) { std::snprintf(b, sizeof b, "%s%.3f", i % 4 ? " " : " | ", f(alu0[i])); s += b; }
+      LOG("[dumpvs]   alu(+0)0..15:%s", s.c_str());
+      for (int blk = 0; blk < 4; ++blk) {
+        const uint32_t addr = r[mmSQ_VTX_UNIFORM_BLOCK_START + blk * 7], size = r[mmSQ_VTX_UNIFORM_BLOCK_START + blk * 7 + 1] + 1;
+        if (!addr) continue;
+        const auto* p = static_cast<const uint8_t*>(mem::ptr(addr));
+        s.clear();
+        for (uint32_t i = 0; i < 48 && i * 4 < size; ++i) {
+          uint32_t w; std::memcpy(&w, p + i * 4, 4);  // uploaded as is (uniform())
+          std::snprintf(b, sizeof b, "%s%.3f", i % 4 ? " " : " | ", f(w)); s += b;
+        }
+        LOG("[dumpvs]   block %d @%08X size %u:%s", blk, addr, size, s.c_str());
+      }
+    }
+  }
+  if (!skipVs.empty() && std::find(skipVs.begin(), skipVs.end(), vsAddress) != skipVs.end()) return;
   if (shadersOut && vs && vs->ready() && ps && ps->ready()) {
     shadersOut->fs = fs;
     shadersOut->fsKey = fsKey;
@@ -3347,7 +3696,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   }
   rprof::mark(rprof::kIndices);
   DrawTargets targets;
-  if (fast) targets = continued.targets;
+  // partial: the state's targets while their registers did not change and the scissor leaves the
+  // same colour buffers active (continued_reason)
+  const bool partialTargets = partial && !(partialChanged & gx2::kSgPartialTargetsMask) &&
+      (r[REGADDR::PA_SC_GENERIC_SCISSOR_BR] == continued.scissorBR ||
+       LatteMRT::GetActiveColorBufferMask(ps->dec, *reinterpret_cast<const LatteContextRegister*>(r)) ==
+           continued.targets.activeColors);
+  if (fast || partialTargets) targets = continued.targets;
   else if (!(replay ? resolve_replay_targets(r, ps, targets) : resolve_targets(r, ps, targets)))
     return;
   auto& colors = targets.colors;
@@ -3357,7 +3712,11 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   const float sx = targets.sx, sy = targets.sy;
   clouds_before_draw(r, ps, colors[0], slices[0], depth);  // clouds.cpp: cloud shadows
   rprof::mark(rprof::kTargets);
-  auto &p = fast ? *continued.pipeline
+  // partial: the same pipeline key (same shaders, topology and targets, no key register changed)
+  const bool partialSameTargets = partial && targets.same(continued.targets);
+  const bool partialPipeline = partialSameTargets && topology == continued.topology &&
+                               !(partialChanged & gx2::kSgPartialPipelineMask);
+  auto &p = fast || partialPipeline ? *continued.pipeline
       : replay && replay->formats == target_formats(colors, depth) ? *replay->pipeline
       : pipeline(r, vs, ps, fs, topology, colors, depth);
   rprof::mark(rprof::kPipeline);
@@ -3379,8 +3738,25 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       ? (stereoEye ? 1.0f : -1.0f)*stereo::frame.depth*stereo::eyeDistanceAtUnitDepth : 0.0f;
   const bool sunShadow = ps->kind == gfx::ProgramKind::SunShadowMask;
   const bool recordState = fastPathDraw && !fast;
-  if (recordState)
+  if (recordState && !partial)
     for (auto& stage : continued.stages) stage = {};
+  // partial: a stage keeps the state's texture/sampler bindings while the targets are the same and no
+  // texture or sampler register changed. As on a continued draw, its textures' guest writes upload
+  // first; an upload (of these or of the vertex stage's resolution before) ends the surface epoch
+  // the bindings were resolved in, and the stage resolves in full. Each stage decides right before
+  // it binds, so the pixel stage sees what the vertex stage uploaded, in the full path's order.
+  const bool partialTextures = partialSameTargets && !(partialChanged & gx2::kSgPartialTexturesMask);
+  std::array<bool, 2> partialStage{};
+  auto partial_stage = [&](int s) {
+    if (!partial) return;
+    auto& stage = continued.stages[s];
+    if (partialTextures) {
+      for (uint32_t i = 0; i < stage.count; ++i) upload_surface(stage.textures[i].surface);
+      partialStage[s] = g_surface_epoch == continued.surfaceEpoch;
+    }
+    if (!partialStage[s]) stage = {};
+  };
+  partial_stage(0);
   // eye 1 replays a stage of eye 0's draw at the same scale through the same pipeline
   const bool replayStages = replay && &p == replay->pipeline && replay->sx == sx && replay->sy == sy;
   StageResources vres, pres;
@@ -3388,13 +3764,16 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (!replayStages || !replay->stages[0].valid ||
       !replay_stage(replay->stages[0], r, vs, cameraEye, colors, depth, vres))
     vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, cameraEye, sunShadow,
-                      fast ? &continued.stages[0] : nullptr, recordState ? &continued.stages[0] : nullptr,
+                      fast || partialStage[0] ? &continued.stages[0] : nullptr,
+                      recordState && !partialStage[0] ? &continued.stages[0] : nullptr,
                       shadersOut ? &shadersOut->stages[0] : nullptr);
+  partial_stage(1);
   if (!replayStages || !replay->stages[1].valid ||
       !replay_stage(replay->stages[1], r, ps, sunShadow ? cameraEye : 0, colors, depth, pres))
     pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe,
                       sunShadow ? cameraEye : 0, sunShadow,
-                      fast ? &continued.stages[1] : nullptr, recordState ? &continued.stages[1] : nullptr,
+                      fast || partialStage[1] ? &continued.stages[1] : nullptr,
+                      recordState && !partialStage[1] ? &continued.stages[1] : nullptr,
                       shadersOut ? &shadersOut->stages[1] : nullptr);
   if (shadersOut) {
     shadersOut->stages[0].resources = vres;
@@ -3428,7 +3807,35 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       c.vs = vs;
       c.ps = ps;
       c.targets = targets;
+      c.scissorBR = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
       c.pipeline = &p;
+      partialGroups[stereoEye] = 0;  // the groups changed since this state
+      if (partial) {
+        auto& st = continuedStats;
+        ++st.partial;
+        st.partialTargets += partialTargets;
+        st.partialPipeline += partialPipeline;
+        st.partialStages[0] += partialStage[0];
+        st.partialStages[1] += partialStage[1];
+        // WWHD_VK_FASTPATH_VERIFY: the full resolution against everything this draw recorded,
+        // reused or resolved (the texture lists only of a state that can continue: a stage that cannot
+        // was resolved in full, but the targets and pipeline it was drawn with may have been reused)
+        static uint64_t partialVerifyCounter = 0;
+        if (fastPath.verifyEvery && ++partialVerifyCounter % fastPath.verifyEvery == 0) {
+          ++st.verified;
+          ++st.totalVerified;
+          if (!verify_continued(r, prim, true, c.valid)) {
+            c.valid = false;
+            c.invalidReason = kVerifyMismatch;
+          }
+        }
+      }
+      if (fastPath.oracle) {
+        OracleKey key;
+        oracle_ps_key(r, key);
+        if (registerBreak && !partial) oracle_count(oracleCombo, oracle.saved[stereoEye], c, oracle.psKey[stereoEye], key);
+        oracle.psKey[stereoEye] = key;
+      }
     }
   }
   // Texture uploads, feedback copies, and sampling transitions above may have
@@ -3805,8 +4212,10 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     rprof::guest_read(rprof::kUpVertex, addr, copied);
     const uint64_t windowBegin=uint64_t(extent.minimum)*stride;
     const uint64_t windowEnd=uint64_t(extent.maximum)*stride+attributeEnd;
+    // Converted indices (quads) too: a buffer drawn in consecutive chunks otherwise copies its
+    // whole prefix once per chunk; their extent is the memoized scan of the converted bytes.
     const bool copyWindow=vertex_copy_window_enabled() &&
-        (nativeIndices || !indices.empty()) && supported && rate &&
+        (nativeIndices || convertedEntry || !indices.empty()) && supported && rate &&
         attributeEnd && stride && extent.valid && vertexExtent.valid &&
         windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
     UploadSlice b;
