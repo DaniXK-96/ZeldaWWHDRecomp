@@ -2967,8 +2967,12 @@ Pipeline* masked_variant(Pipeline& own, const uint32_t* r, vk::Shader* vs, vk::S
 //   is patched (stage_memo_patch_blocks);
 // - its textures: the same surfaces, views and samplers (the continued state's), the same surface scales
 //   and artistic-mips flags (support uniforms hold the scales).
-// Not recorded with stereo, eye shifts, a stereo/backdrop replay record (replayOut), feedback copies,
-// AO substitutes, nor for the bloom extract (its scale is a live setting).
+// Only with dynamic uniform offsets (the set then names no upload offset). Not recorded with stereo, eye
+// shifts, a stereo/backdrop replay record (replayOut), feedback copies, AO substitutes, nor for the
+// bloom extract (its scale is a live setting).
+// Verify mode (WWHD_VK_FASTPATH_VERIFY) also keeps the memo's support uniform bytes: the support block is
+// uploaded again by the check's own binding, at another offset unless WWHD_VK_REUSE_UNIFORM_SNAPSHOTS
+// finds the same bytes, so that offset is compared by its bytes.
 struct StageMemoTexture {
   uint32_t unit = 0;
   int binding = -1;
@@ -2993,6 +2997,8 @@ struct StageMemo {
   std::array<VkBuffer, 16> blockBuffers{};
   std::array<VkDeviceSize, 16> blockRanges{};
   std::array<int8_t, 16> blockDynamic{};
+  int supportDynamic = -1;              // the support uniform block's dynamic offset index in out
+  std::vector<uint8_t> supportBytes;    // verify mode only: the support uniforms bound
   uint32_t textureCount = 0;
   std::array<StageMemoTexture, LATTE_NUM_MAX_TEX_UNITS> textures{};
   StageResources out;
@@ -3016,7 +3022,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   // WWHD_VK_STAGE_MEMO: whether this binding may be memoized (StageMemo); cleared by anything it does not cover
   if (memo) memo->valid = false;
   const uint64_t memoSeq = memo ? wwatch::write_seq() : 0;
-  bool memoable = memo && !replayOut && eyeOffset == 0 && stereo::frame.mode == stereo::Off && sh->dec &&
+  bool memoable = memo && dynamicUniforms && !replayOut && eyeOffset == 0 && stereo::frame.mode == stereo::Off && sh->dec &&
                   (sh->uniforms.offset_remapped < 0 || sh->dec->list_remappedUniformEntries_bufferGroups.empty());
   if (memo) memo->textureCount = 0;
   std::array<UploadSlice, 16> memoBlockSlices{};  // the buffer cache slices of the guest blocks (StageMemo)
@@ -3478,6 +3484,11 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       c.blockWords[i * 2 + 1] = bound ? r[block + i * 7 + 1] : 0;
     }
     c.out = out;
+    c.supportDynamic = -1;
+    for (uint32_t j = 0; j < dynamicCount; ++j)
+      if (m.uniformVarsBufferBindingPoint >= 0 && dynamicBindings[j].first == uint32_t(m.uniformVarsBufferBindingPoint))
+        c.supportDynamic = int(j);
+    if (fastpath_config().verifyEvery) c.supportBytes.assign(supportUniforms.begin(), supportUniforms.end());
     for (int i = 0; i < 16; ++i) {
       c.blockBuffers[i] = memoBlockSlices[i].buffer;
       c.blockRanges[i] = memoBlockSlices[i].size;
@@ -3783,7 +3794,10 @@ void drain_pending_guest_pipelines() {
   catch (...) { g_drainingPipelines = false; throw; }
   g_drainingPipelines = false;
 }
-void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; continuedEyes = {}; }
+void reset_pipeline_lookup_cache() {
+  lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; continuedEyes = {};
+  for (auto& eye : stageMemos) for (auto& m : eye) m.valid = false;
+}
 uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
 // WWHD_VK_TRACE_PASSES=1 (issue #144): log each new render pass shape once, just before the driver
 // sees it, so a crash inside vkCmdBeginRendering names the last pass in the crash report's log lines
@@ -4363,21 +4377,32 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     if (fastPath.verifyEvery && ++memoVerifyCounter % fastPath.verifyEvery == 0) {
       // the binding as without the memo, compared with the memo's result (which it replaces)
       const StageResources memoized = c.out;
+      const int supportIndex = c.supportDynamic;
+      static std::vector<uint8_t> memoBytes;
+      memoBytes = c.supportBytes;
       res = bind_stage(r, sh, p.sets[s], p.dynamicUniforms, sx, sy, colors, depth, probe, eyeOffset, sunShadow,
                        &continued.stages[s], nullptr, nullptr, nullptr, &c);
       auto& st = continuedStats;
       ++st.stageMemoVerified;
       ++st.totalStageMemoVerified;
-      if (res.set != memoized.set || res.dynamicOffsetCount != memoized.dynamicOffsetCount ||
-          !std::equal(res.dynamicOffsets.begin(), res.dynamicOffsets.begin() + res.dynamicOffsetCount,
-                      memoized.dynamicOffsets.begin())) {
+      // the support block by its bytes (the binding just packed them: c.supportBytes, when it memoized
+      // again; else they cannot be compared and the offset must match)
+      const bool bytesKnown = c.valid && c.supportBytes.size() == memoBytes.size();
+      const bool supportSame = bytesKnown && c.supportBytes == memoBytes;
+      bool same = res.set == memoized.set && res.dynamicOffsetCount == memoized.dynamicOffsetCount;
+      for (uint32_t j = 0; same && j < res.dynamicOffsetCount; ++j)
+        same = res.dynamicOffsets[j] == memoized.dynamicOffsets[j] || (int(j) == supportIndex && supportSame);
+      if (bytesKnown && !supportSame) same = false;
+      if (!same) {
         ++st.stageMemoMismatches;
         ++st.totalStageMemoMismatches;
         static int logged = 0;
         if (logged++ < 50)
-          LOG("[vulkan stage memo] verify mismatch #%llu: %s shader %016llx, set %s, %u/%u dynamic offsets; frame %llu draw %llu",
+          LOG("[vulkan stage memo] verify mismatch #%llu: %s shader %016llx, set %s, %u/%u dynamic offsets, support "
+              "uniforms %s; frame %llu draw %llu",
               (unsigned long long)st.totalStageMemoMismatches, sh->vertex ? "vertex" : "pixel", (unsigned long long)sh->key,
               res.set == memoized.set ? "same" : "differs", res.dynamicOffsetCount, memoized.dynamicOffsetCount,
+              !bytesKnown ? "not compared" : supportSame ? "same" : "differ",
               (unsigned long long)R.frame, (unsigned long long)R.drawCount);
       }
       return true;
