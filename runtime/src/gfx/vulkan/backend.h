@@ -44,6 +44,10 @@ struct Surface {
  uint64_t writeSeq=0,contentHash=0,lastCheckedFrame=~0ull,sparseHash=0;
  bool formatViews=false; // another surface at this address has the same texel bits in another format (adopt_newer_alias)
  uint64_t writtenBackSeq=0; // writeSeq when last written back to guest memory (linear surfaces, write_back_linear_targets)
+ // diagnostics only (WWHD_VK_FEEDBACK_STATS, WWHD_VK_CLEAR_STATS): the writeSeq of the last write that can change
+ // texels (clears, copies, uploads, and draws with a nonzero colour mask or depth/stencil writes; the other
+ // draws advance writeSeq too); a GX2 clear not yet followed by any other use of the image
+ uint64_t contentSeq=0; bool clearPending=false;
  // CPU textures: write stamp (write_watch.h) of all levels' pages at the last full check
  uint64_t watchStamp=0; bool watched=false;
  // stereo: eye 1's held commands of this flush generation sample this eye 0 texture (stereo.h)
@@ -345,7 +349,15 @@ uint64_t next_write_seq();
 extern uint64_t g_surface_epoch;
 // bumped whenever a surface cache gains, loses or swaps surfaces (texture invalidation's footprint index)
 extern uint64_t g_surface_set_gen;
-inline void mark_gpu_written(Surface* s){s->gpuWritten=true;s->writeSeq=next_write_seq();++g_surface_epoch;}
+inline void mark_gpu_written(Surface* s){s->gpuWritten=true;s->writeSeq=s->contentSeq=next_write_seq();++g_surface_epoch;}
+// WWHD_VK_CLEAR_STATS=1 (diagnostics): how many GX2 clears the next render pass on the surface could have done
+// as its load operation (a pass that begins with the cleared image as a whole attachment, nothing between) and
+// how many another use needed first; every 120 frames ("[vulkan clears]")
+struct ClearStats { uint64_t clears = 0, whole = 0, intoPass = 0, otherUse = 0; };
+extern ClearStats g_clearStats;
+bool clear_stats_enabled();
+void report_clear_stats();
+inline void clear_pending_used(Surface* s){if(s->clearPending){s->clearPending=false;++g_clearStats.otherUse;}}
 // A draw's own attachments: their newer writeSeq can only change lookups at their own addresses,
 // which the fast path excludes (draw.cpp); a surface becoming GPU-written still ends the epoch.
 inline void mark_draw_target_written(Surface* s){if(!s->gpuWritten)++g_surface_epoch;s->gpuWritten=true;s->writeSeq=next_write_seq();}

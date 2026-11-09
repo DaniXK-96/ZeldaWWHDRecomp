@@ -1741,7 +1741,28 @@ void upload_surface(Surface* s) {
                 v.artistic?"hand-drawn":"downscaled");
         s->artisticMips=v.artistic;
     }
-    s->contentHash=hash;s->writeSeq=next_write_seq();s->dirty=false;++g_stat_uploads;++g_surface_epoch;
+    s->contentHash=hash;s->writeSeq=s->contentSeq=next_write_seq();s->dirty=false;++g_stat_uploads;++g_surface_epoch;
+}
+ClearStats g_clearStats;
+bool clear_stats_enabled() {
+    static const bool enabled=[]{const char* e=std::getenv("WWHD_VK_CLEAR_STATS");return e&&!std::strcmp(e,"1");}();
+    return enabled;
+}
+void report_clear_stats() {
+    static uint64_t previousFrame=0;
+    if(R.frame-previousFrame<120)return;
+    const double frames=double(R.frame-previousFrame);
+    const auto& t=g_clearStats;
+    LOG("[vulkan clears] %.1f/frame, %.1f of whole images; the next use: a render pass with the image as a whole attachment %.1f/frame "
+        "(could load as a clear), another use %.1f/frame",
+        t.clears/frames,t.whole/frames,t.intoPass/frames,t.otherUse/frames);
+    g_clearStats={};previousFrame=R.frame;
+}
+// WWHD_VK_CLEAR_STATS: a clear of the whole image (every layer and aspect) waits for its next use
+static void note_clear(Surface* s,bool whole) {
+    if(!clear_stats_enabled())return;
+    ++g_clearStats.clears;g_clearStats.whole+=whole;
+    s->clearPending=whole;
 }
 void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
     uint32_t first,num;auto* s=surface_from_color_buffer(cb,&first,&num);if(!s)return;
@@ -1773,6 +1794,7 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
     // a volume has one layer; its depth is in the extent
     VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,1,s->imageType==VK_IMAGE_TYPE_3D?0:first,s->imageType==VK_IMAGE_TYPE_3D?1:num};
     record::vkCmdClearColorImage(command_buffer(),s->image,s->layout,&value,1,&range);mark_gpu_written(s);
+    note_clear(s,s->imageType!=VK_IMAGE_TYPE_3D&&first==0&&num>=s->arrayLayers&&s->mips==1);
 }
 void clear_depth_stencil(const uint32_t*,uint32_t db,float depth,uint32_t stencil,uint32_t flags) {
     uint32_t first,num;auto* s=surface_from_depth_buffer(db,&first,&num);if(!s)return;
@@ -1784,6 +1806,7 @@ void clear_depth_stencil(const uint32_t*,uint32_t db,float depth,uint32_t stenci
     end_encoder();transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
     VkClearDepthStencilValue value{depth,stencil};VkImageSubresourceRange range{aspects,0,1,first,num};
     record::vkCmdClearDepthStencilImage(command_buffer(),s->image,s->layout,&value,1,&range);mark_gpu_written(s);
+    note_clear(s,first==0&&num>=s->arrayLayers&&s->mips==1&&aspects==s->aspect);
     if(framegen)reproj::depth_cleared(s);
 }
 // ---------------------------------------------------------------- write-back to guest memory

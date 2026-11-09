@@ -88,9 +88,30 @@ En PC (Linux/Windows/macOS) también sirve `tools/bench/run_bench.py` con
 En PC: `tools/bench/run_picture_check.py` con la variante D frente a la base. En el teléfono, capturas
 (F10 o el atajo de captura) en el mismo punto con A y con D.
 
+## Paso 5: contadores para decidir las optimizaciones de GPU (solo diagnóstico)
+
+No cambian el renderizado. Un arranque con:
+
+```
+WWHD_VK_CLEAR_STATS=1
+WWHD_VK_FEEDBACK_STATS=1
+```
+
+En la aldea, el bosque, un interior y una mazmorra, copiar del log (cada 120 frames):
+
+- `[vulkan clears] X/frame, Y of whole images; ... render pass ... Z/frame (could load as a clear), another use W/frame`.
+  Si Z es alto, convertir esos clears en `LOAD_OP_CLEAR` ahorra una escritura y una lectura completas de
+  cada imagen por frame en la GPU del teléfono.
+- `[vulkan feedback copies] ... N repeats of an unchanged source/frame (M M texels/frame) ...`.
+  Si N es alto, guardar la copia y reutilizarla ahorra una copia completa y un corte de pass por cada
+  repetición.
+
+Son estimaciones: cuentan lo que se podría ahorrar, no lo ahorran.
+
 ## Qué informar
 
 1. Si compila (y el error, si no).
 2. Las líneas de verificación del paso 2 (los totales de mismatches).
 3. Las líneas `[prof] draw phases ...` y el tiempo del render thread de A, B, C y D en cada lugar.
-4. Cualquier diferencia visible.
+4. Las líneas `[vulkan clears]` y `[vulkan feedback copies]` del paso 5.
+5. Cualquier diferencia visible.

@@ -2080,6 +2080,9 @@ struct FeedbackStatsProbe {
 };
 struct FeedbackStats {
   uint64_t aliases=0,duplicates=0,texels=0,duplicateTexels=0;
+  // copies of a source with no texel-changing write since the same stage and unit copied it last
+  // (Surface::contentSeq; this frame): a kept copy could serve them without a copy or a pass end
+  uint64_t repeats=0,repeatTexels=0;
   uint64_t color=0,depth=0,stencil=0,compressed=0,saturated=0;
 };
 FeedbackStats feedbackStats;
@@ -2108,8 +2111,9 @@ void report_feedback_stats() {
   if(R.frame-previousFrame<120) return;
   const double frames=double(R.frame-previousFrame);
   const auto& t=feedbackStats;
-  LOG("[vulkan feedback copies] %.2f aliases/frame %.2f duplicate source versions/frame; %.3f M physical texels/frame %.3f M duplicate texels/frame; color/depth/stencil/compressed %llu/%llu/%llu/%llu; %llu saturated; copies unchanged",
-      t.aliases/frames,t.duplicates/frames,t.texels/frames/1e6,t.duplicateTexels/frames/1e6,
+  LOG("[vulkan feedback copies] %.2f aliases/frame %.2f duplicate source versions/frame; %.3f M physical texels/frame %.3f M duplicate texels/frame; "
+      "%.2f repeats of an unchanged source/frame (%.3f M texels/frame); color/depth/stencil/compressed %llu/%llu/%llu/%llu; %llu saturated; copies unchanged",
+      t.aliases/frames,t.duplicates/frames,t.texels/frames/1e6,t.duplicateTexels/frames/1e6,t.repeats/frames,t.repeatTexels/frames/1e6,
       (unsigned long long)t.color,(unsigned long long)t.depth,(unsigned long long)t.stencil,
       (unsigned long long)t.compressed,(unsigned long long)t.saturated);
   feedbackStats={};previousFrame=R.frame;
@@ -2127,6 +2131,15 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
     feedbackStats.depth+=bool(source->aspect&VK_IMAGE_ASPECT_DEPTH_BIT);
     feedbackStats.stencil+=bool(source->aspect&VK_IMAGE_ASPECT_STENCIL_BIT);
     feedbackStats.compressed+=source->fmt.compressed;
+    struct Last { const Surface* source=nullptr; VkImage image=VK_NULL_HANDLE; uint64_t contentSeq=0, frame=~0ull; };
+    static std::array<Last,2*LATTE_NUM_MAX_TEX_UNITS> last;
+    if(unit<LATTE_NUM_MAX_TEX_UNITS) {
+      auto& l=last[(vertex?LATTE_NUM_MAX_TEX_UNITS:0)+unit];
+      if(l.source==source && l.image==source->image && l.contentSeq==source->contentSeq && l.frame==R.frame) {
+        ++feedbackStats.repeats;add(feedbackStats.repeatTexels);
+      }
+      l={source,source->image,source->contentSeq,R.frame};
+    }
   }
   static const bool reuse = [] {
     const char* e = std::getenv("WWHD_VK_REUSE_FEEDBACK_IMAGES");
@@ -4312,6 +4325,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (trackTargets) track_drawn(r, colors, depth, subsetClear);
   if (!p.pipeline && !p.pendingCompile) return; // terminal driver failure, not pending
   if(feedback_stats_enabled()) report_feedback_stats();
+  if(clear_stats_enabled()) report_clear_stats();
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
   auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
@@ -4583,6 +4597,15 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     end_encoder();
     std::array<VkRenderingAttachmentInfo, 8> attachments{};
     uint32_t ncolor = 0;
+    // WWHD_VK_CLEAR_STATS: a cleared image this pass takes whole as an attachment (it renders over all of it)
+    auto clearIntoPass = [&](Surface* a) {
+      if (!a->clearPending) return;
+      a->clearPending = false;
+      if (a->arrayLayers == 1 && a->extent.depth == 1 && a->extent.width == width && a->extent.height == height)
+        ++g_clearStats.intoPass;
+      else
+        ++g_clearStats.otherUse;
+    };
     for (int i = 0; i < 8; i++) {
       attachments[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
       attachments[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -4590,6 +4613,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       if (colors[i]) {
         upload_surface(colors[i]);
+        clearIntoPass(colors[i]);
         transition_image(colors[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
@@ -4601,6 +4625,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (depth) {
       upload_surface(depth);
+      clearIntoPass(depth);
       transition_image(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
@@ -4991,6 +5016,11 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   for (int i = 0; i < 8; i++)  // (slots taken over by a pass subset aren't written)
     if (colors[i] && !((subsetAbsent >> i) & 1)) mark_draw_target_written(colors[i]);
   if (depth) mark_draw_target_written(depth);
+  if (feedback_stats_enabled()) {  // the draw's writes that can change texels (Surface::contentSeq)
+    for (int i = 0; i < 8; i++)
+      if (colors[i] && !((subsetAbsent >> i) & 1) && writes_color(r, i)) colors[i]->contentSeq = colors[i]->writeSeq;
+    if (writes_depth(r, depth)) depth->contentSeq = depth->writeSeq;
+  }
   R.drawCount++;
   if (aoPrivateReplay) {
     ao_private().frame = R.frame;

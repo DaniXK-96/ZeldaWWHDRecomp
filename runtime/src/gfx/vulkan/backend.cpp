@@ -1238,6 +1238,7 @@ void transition_buffer(Buffer& buffer, VkPipelineStageFlags stage, VkAccessFlags
 }
 bool transition_image(Surface *s, VkImageLayout layout,
                       VkPipelineStageFlags stage, VkAccessFlags access) {
+  clear_pending_used(s);  // WWHD_VK_CLEAR_STATS (draw.cpp takes a pass's attachments before this)
   const bool conservativePassBreak = s->layout != layout ||
       layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || access != VK_ACCESS_SHADER_READ_BIT;
   if (conservativePassBreak) stereo_release_texture(s);  // a texture both eyes sample
