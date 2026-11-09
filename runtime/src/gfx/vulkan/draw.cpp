@@ -2319,6 +2319,11 @@ struct ContinuedTexture {
   Surface* surface = nullptr;
   VkImageView view = VK_NULL_HANDLE;
   VkSampler sampler = VK_NULL_HANDLE;
+  // WWHD_VK_FASTPATH_PARTIAL only (else left zero): the register words its resolution read, the unit's
+  // SQ_TEX_RESOURCE words and its sampler's SQ_TEX_SAMPLER words (resolve_texture, sampled_texture_view,
+  // resolve_sampler), for the partial reuse of single texture units (bind_stage)
+  std::array<uint32_t, 7> words{};
+  std::array<uint32_t, 3> samplerWords{};
 };
 struct ContinuedStage {
   uint32_t count = 0;
@@ -2327,6 +2332,11 @@ struct ContinuedStage {
   void add(const ContinuedTexture& t) {
     if (count < textures.size()) textures[count++] = t;
     else continuable = false;
+  }
+  // empty (the entries past count are never read)
+  void reset() {
+    count = 0;
+    continuable = true;
   }
 };
 struct DrawTargets {
@@ -2433,6 +2443,8 @@ struct ContinuedStats {
   // shaders, and of those the pieces reused
   uint64_t partialCandidates = 0, partial = 0, partialTargets = 0, partialPipeline = 0;
   std::array<uint64_t, 2> partialStages{};
+  // texture units of the stages resolved unit by unit (bind_stage units): reused, resolved
+  uint64_t partialUnitsReused = 0, partialUnitsResolved = 0;
   std::array<uint64_t, kReasons> reasons{};
   std::array<uint64_t, gx2::kSgCount> groups{};  // register groups that ended a continuation
   std::array<uint64_t, 8> mismatchKinds{};
@@ -2561,9 +2573,10 @@ void report_continued_stats() {
       auto pct = [&](uint64_t a) { return st.partial ? 100.0 * a / st.partial : 0.0; };
       k += std::snprintf(buf + k, sizeof buf - k,
                          "; partial: %.1f/frame of %.1f candidates (reused targets %.0f%% pipeline %.0f%% "
-                         "vs textures %.0f%% ps textures %.0f%%)",
+                         "vs textures %.0f%% ps textures %.0f%%; by unit: %.1f/frame reused, %.1f resolved)",
                          st.partial / frames, st.partialCandidates / frames, pct(st.partialTargets),
-                         pct(st.partialPipeline), pct(st.partialStages[0]), pct(st.partialStages[1]));
+                         pct(st.partialPipeline), pct(st.partialStages[0]), pct(st.partialStages[1]),
+                         st.partialUnitsReused / frames, st.partialUnitsResolved / frames);
     }
     if (fastpath_config().verifyEvery && k < int(sizeof buf))
       k += std::snprintf(buf + k, sizeof buf - k, "; verify: %llu checked, %llu mismatches (total %llu of %llu)",
@@ -2915,7 +2928,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                           Surface *depth, FeedbackStatsProbe* feedbackProbe, float eyeOffset = 0,
                           bool sunShadow = false,
                           const ContinuedStage* reuse = nullptr, ContinuedStage* record = nullptr,
-                          StageReplay* replayOut = nullptr) {
+                          StageReplay* replayOut = nullptr, const ContinuedStage* units = nullptr) {
   const uint64_t stageEntered = rprof::sub_begin();
   StageResources out;
   auto &m = sh->mapping;
@@ -3203,7 +3216,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       bindTexture(t.unit, t.binding, t.surface, t.view, t.sampler);
       replayTexture(t.surface, t.unit, t.binding, false);  // continued: neither feedback nor AO
     }
-  } else
+  } else {
+  // WWHD_VK_FASTPATH_PARTIAL, units: the stage's textures as the partial continuation's state recorded
+  // them (the same shader, targets, frame and settings; it could continue). A unit whose texture and
+  // sampler words are the recorded ones keeps its recorded texture, view and sampler while the surface
+  // epoch is still the state's after its texture's upload (an upload, also of an earlier unit resolved
+  // here, can change lookups); every other unit resolves as below. Unit by unit in the shader's order,
+  // so the uploads and transitions keep the full path's order.
+  const uint32_t samplerBase = REGADDR::SQ_TEX_SAMPLER_WORD0_0 + (sh->vertex ? 18 : 0) * 3;
+  uint32_t recorded = 0;  // the next recorded texture (units lists them in this loop's order)
   for (int i = 0; i < sh->dec->textureUnitListCount; i++) {
     uint32_t unit = sh->dec->textureUnitList[i];
     if (unit >= LATTE_NUM_MAX_TEX_UNITS)
@@ -3211,6 +3232,31 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     int binding = m.textureUnitToBindingPoint[unit];
     if (binding < 0)
       continue;
+    if (units) {
+      const ContinuedTexture* t = recorded < units->count ? &units->textures[recorded] : nullptr;
+      ++recorded;
+      const uint32_t si = sh->dec->textureUnitSamplerAssignment[unit];
+      if (t && t->unit == unit && t->binding == binding && si < 18 &&
+          !std::memcmp(t->words.data(), r + texbase + unit * 7, sizeof t->words) &&
+          !std::memcmp(t->samplerWords.data(), r + samplerBase + si * 3, sizeof t->samplerWords)) {
+        const uint64_t epoch = g_surface_epoch;
+        upload_surface(t->surface);
+        if (g_surface_epoch == epoch && epoch == continuedEyes[stereoEye].surfaceEpoch) {
+          sample_transition(t->surface,
+                            narrow_barriers()
+                                ? (sh->vertex ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+                                              : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+                                : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT));
+          bindTexture(unit, binding, t->surface, t->view, t->sampler);
+          replayTexture(t->surface, unit, binding, false);  // recorded continuable: neither feedback nor AO
+          if (record) record->add(*t);
+          ++continuedStats.partialUnitsReused;
+          continue;
+        }
+      }
+      ++continuedStats.partialUnitsResolved;
+    }
     bool substituted = false;
     Surface* s = resolve_texture(r, sh, unit, &substituted);
     // the point-light passes read the buffer's depth copy on unit 0: they claim the buffer's size for it,
@@ -3238,8 +3284,15 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     replayTexture(s, unit, binding, aliases || substituted);
     if (record) {
       if (aliases || substituted || shares_target_address(s, colors, depth)) record->continuable = false;
-      record->add({unit, binding, s, sampledView, samplerValue});
+      ContinuedTexture t{unit, binding, s, sampledView, samplerValue};
+      if (fastpath_config().partial) {
+        const uint32_t si = sh->dec->textureUnitSamplerAssignment[unit];
+        std::memcpy(t.words.data(), r + texbase + unit * 7, sizeof t.words);
+        if (si < 18) std::memcpy(t.samplerWords.data(), r + samplerBase + si * 3, sizeof t.samplerWords);
+      }
+      record->add(t);
     }
+  }
   }
   rprof::mark(rprof::kTextures);
   if (m.uniformVarsBufferBindingPoint >= 0) {
@@ -4057,14 +4110,19 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   const bool sunShadow = ps->kind == gfx::ProgramKind::SunShadowMask;
   const bool recordState = fastPathDraw && !fast;
   if (recordState && !partial)
-    for (auto& stage : continued.stages) stage = {};
+    for (auto& stage : continued.stages) stage.reset();
   // partial: a stage keeps the state's texture/sampler bindings while the targets are the same and no
   // texture or sampler register changed. As on a continued draw, its textures' guest writes upload
   // first; an upload (of these or of the vertex stage's resolution before) ends the surface epoch
   // the bindings were resolved in, and the stage resolves in full. Each stage decides right before
   // it binds, so the pixel stage sees what the vertex stage uploaded, in the full path's order.
+  // A stage that does not keep them all (a texture or sampler register changed, or an upload) still
+  // keeps, unit by unit, the textures whose registers did not change (bind_stage units): it resolves
+  // from a copy of the state's list (partialUnits), as the stage records its own list in the state.
   const bool partialTextures = partialSameTargets && !(partialChanged & gx2::kSgPartialTexturesMask);
   std::array<bool, 2> partialStage{};
+  std::array<std::optional<ContinuedStage>, 2> partialUnits;
+  std::array<bool, 2> partialByUnit{};
   auto partial_stage = [&](int s) {
     if (!partial) return;
     auto& stage = continued.stages[s];
@@ -4072,7 +4130,11 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       for (uint32_t i = 0; i < stage.count; ++i) upload_surface(stage.textures[i].surface);
       partialStage[s] = g_surface_epoch == continued.surfaceEpoch;
     }
-    if (!partialStage[s]) stage = {};
+    if (!partialStage[s]) {
+      partialByUnit[s] = partialSameTargets && stage.continuable && stage.count;
+      if (partialByUnit[s]) partialUnits[s] = stage;
+      stage.reset();
+    }
   };
   partial_stage(0);
   // eye 1 replays a stage of eye 0's draw at the same scale through the same pipeline
@@ -4090,7 +4152,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, cameraEye, sunShadow,
                       fast || partialStage[0] ? &continued.stages[0] : nullptr,
                       recordState && !partialStage[0] ? &continued.stages[0] : nullptr,
-                      shadersOut ? &shadersOut->stages[0] : nullptr);
+                      shadersOut ? &shadersOut->stages[0] : nullptr, partialByUnit[0] ? &*partialUnits[0] : nullptr);
   partial_stage(1);
   if (!replayStages || !replay->stages[1].valid ||
       !replay_stage(replay->stages[1], r, ps, sunShadow ? cameraEye : 0, colors, depth, pres))
@@ -4098,7 +4160,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                       sunShadow ? cameraEye : 0, sunShadow,
                       fast || partialStage[1] ? &continued.stages[1] : nullptr,
                       recordState && !partialStage[1] ? &continued.stages[1] : nullptr,
-                      shadersOut ? &shadersOut->stages[1] : nullptr);
+                      shadersOut ? &shadersOut->stages[1] : nullptr, partialByUnit[1] ? &*partialUnits[1] : nullptr);
   }
   if (shadersOut) {
     shadersOut->targets=targets;
