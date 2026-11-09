@@ -675,6 +675,13 @@ protected regions. Please run a normal play session, or the benchmark scene, onc
   read guest bytes (converted indices: a fresh conversion) and logs `VERIFY MISMATCH` with address and
   size; a difference caused by a write racing the check (newer stamp) is counted as "raced" instead.
 - `WWHD_VK_BUFFER_CACHE_HINTS=0` ignores the DCFlush/GX2Invalidate hints (write faults only).
+- `WWHD_VK_BUFFER_CACHE_FRONT=1` (off by default): a 64-slot table of the keys looked up last, each with
+  its map entry, is consulted before the map. Consecutive draws look up the same few ranges (uniform
+  blocks, vertex buffers, indices), and a hit skips the key's hash and bucket walk; the entry is then
+  checked exactly as before. The table is emptied whenever an entry is erased (eviction, clear), so a hit
+  is always the entry the map holds. With `WWHD_VK_BUFFER_CACHE_VERIFY=1` every front hit is also looked
+  up in the map (`[vulkan buffer cache] front table:` line, mismatches must stay 0). The `buffer_cache`
+  test runs its scenarios with the table on and compares a random sequence against the map alone.
 
 With `WWHD_VK_CPU_ONLY_STATS=1` the 120-frame report adds a `[vulkan buffer cache]` line: lookups,
 hit rate, uploads, stale entries, dynamic bypasses, resident MiB, hints and protect failures; the

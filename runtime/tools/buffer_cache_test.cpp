@@ -2,7 +2,8 @@
 // the region allocator, hits and sub-ranges, invalidation by CPU writes (page faults), kernel writes
 // (HostWrite), explicit hints (DCFlushRange / GX2Invalidate), save-state loads (invalidate_all),
 // overlapping ranges, converted-data keys, dynamic ranges, deferred region retirement, eviction, the
-// verify mode, and a concurrent writer.
+// verify mode, a concurrent writer, and the front table (WWHD_VK_BUFFER_CACHE_FRONT): the scenarios
+// above run with it on (and its verify check), and a random sequence compares it with the map alone.
 #include "gfx/vulkan/buffer_cache_core.h"
 
 #include <atomic>
@@ -118,6 +119,7 @@ int main() {
 
     TestBacking backing;
     Cache cache(backing);
+    cache.front = cache.frontVerify = true;
     uint64_t frame = 1;
     cache.set_frame(frame);
     const uint32_t P = g_page;
@@ -326,6 +328,82 @@ int main() {
                (unsigned long long)(cache.stats.uploads - s0.uploads),
                (unsigned long long)(cache.stats.verifyMismatches - s0.verifyMismatches));
         assert(cache.stats.verifyMismatches == s0.verifyMismatches);
+    }
+
+    // 14. the front table returns the entry the map would: the scenarios above (front hits verified
+    // against the map), and a random sequence of lookups, uploads, writes, frames, evictions, save-state
+    // loads and clears on two caches, one without it, which must agree on every result
+    assert(cache.stats.frontHits > 0 && cache.stats.frontMismatches == 0);
+    {
+        TestBacking ba, bb;
+        Cache plain(ba), fronted(bb);
+        fronted.front = fronted.frontVerify = true;
+        std::mt19937 rng(23);
+        const uint32_t base = 0x2000000;
+        uint64_t f = 1;
+        plain.set_frame(f);
+        fronted.set_frame(f);
+        // addresses 4 KiB apart (front_slot collisions among them) and a few keys of other kinds
+        auto key = [&](uint32_t r) -> Key {
+            const uint32_t addr = base + (r % 96) * 0x1000 + (r % 3) * 16;
+            switch (r % 7) {
+            case 5: return {addr, kIndexNative, 0};
+            case 6: return {addr, kIndexConverted, uint64_t(r % 4), r % 2 ? 0xFFFFu : 0u};
+            default: return {addr, kRaw, 0};
+            }
+        };
+        uint64_t compared = 0;
+        for (int i = 0; i < 400000; i++) {
+            const uint32_t op = rng() % 1000;
+            if (op < 6) {  // the game writes
+                g_mem[base + rng() % (96 * 0x1000)] ^= uint8_t(1 + rng() % 255);
+            } else if (op < 9) {  // a frame ends; now and then long idle stretches (evictions)
+                f += op == 6 && rng() % 8 == 0 ? Cache::kIdleFrames + 1 : 1 + rng() % 70;
+                for (Cache* c : {&plain, &fronted}) c->set_frame(f);
+                const uint64_t budget = rng() % 4 ? bb.budget : (256u << 10);
+                plain.end_frame(budget);
+                fronted.end_frame(budget);
+                ba.complete();
+                bb.complete();
+                assert(plain.entries() == fronted.entries() && plain.resident_bytes() == fronted.resident_bytes());
+            } else if (op == 9 && rng() % 64 == 0) {
+                plain.invalidate_all();
+                fronted.invalidate_all();
+            } else if (op == 10 && rng() % 256 == 0) {
+                plain.clear();
+                fronted.clear();
+                ba.complete();
+                bb.complete();
+            } else {
+                const uint32_t r = rng();
+                const Key k = key(r % 4 ? r % 24 : r);  // mostly the same few keys, as consecutive draws
+                const uint32_t size = 16 + (r >> 8) % 3 * 2000;
+                Entry *x, *y;
+                const Status sx = plain.lookup(k, size, x), sy = fronted.lookup(k, size, y);
+                assert(sx == sy);
+                if (sx == kMiss) {
+                    std::vector<uint8_t> copy(g_mem + k.addr, g_mem + k.addr + size);
+                    const bool ux = plain.upload(*x, copy.data(), size), uy = fronted.upload(*y, copy.data(), size);
+                    assert(ux == uy);
+                }
+                assert(x->addr == y->addr && x->size == y->size && x->outSize == y->outSize &&
+                       x->region.valid() == y->region.valid() && x->dynamicUntil == y->dynamicUntil);
+                if (x->region.valid()) assert(!memcmp(x->region.mapped, y->region.mapped, x->outSize));
+                ++compared;
+            }
+        }
+        const Stats &a = plain.stats, &b = fronted.stats;
+        assert(a.lookups == b.lookups && a.hits == b.hits && a.uploads == b.uploads && a.staleWrites == b.staleWrites &&
+               a.grows == b.grows && a.newEntries == b.newEntries && a.bypassDynamic == b.bypassDynamic &&
+               a.becameDynamic == b.becameDynamic && a.evictions == b.evictions && a.epochDrops == b.epochDrops);
+        assert(a.frontHits == 0 && b.frontHits > 0 && b.frontMismatches == 0);
+        printf("front table: ok (%llu lookups compared, %.1f%% front hits, %llu evictions, %llu uploads)\n",
+               (unsigned long long)compared, 100.0 * double(b.frontHits) / double(b.lookups),
+               (unsigned long long)b.evictions, (unsigned long long)b.uploads);
+        plain.clear();
+        fronted.clear();
+        ba.complete();
+        bb.complete();
     }
 
     cache.clear();

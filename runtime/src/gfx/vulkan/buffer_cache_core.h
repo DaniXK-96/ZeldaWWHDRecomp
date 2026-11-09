@@ -35,6 +35,7 @@
 // kMaxBackoff frames) it is tried again.
 #pragma once
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -161,6 +162,7 @@ struct Entry {
 
 struct Stats {
   uint64_t lookups = 0, hits = 0, uploads = 0, uploadBytes = 0;
+  uint64_t frontHits = 0, frontMismatches = 0;  // front table (Cache::front): hits, verify-mode mismatches
   uint64_t staleWrites = 0, staleHintOnly = 0, grows = 0, newEntries = 0;
   uint64_t bypassDynamic = 0, bypassNoMemory = 0, becameDynamic = 0;
   uint64_t verifyChecks = 0, verifyMismatches = 0, verifyRaced = 0;
@@ -173,6 +175,13 @@ class Cache {
  public:
   // verify mode: keep a CPU copy of every upload, so verify() never reads the mapped GPU memory
   bool keepShadow = false;
+  // front table (WWHD_VK_BUFFER_CACHE_FRONT=1): a small direct-mapped table of the keys looked up last,
+  // each with its map entry, consulted before the map. A draw looks up the same few ranges as the draw
+  // before it (uniform blocks, vertex buffers, indices), and a hit skips the key's hash and bucket
+  // walk. It holds pointers to map nodes, which stay valid until a node is erased (end_frame,
+  // clear: both empty the table), so a hit is the entry the map would return. frontVerify (with the
+  // cache's verify mode): every hit is also looked up in the map and compared (Stats::frontMismatches).
+  bool front = false, frontVerify = false;
   static constexpr uint32_t kChurnLimit = 3, kChurnFrames = 4;
   static constexpr uint64_t kFirstBackoff = 64, kMaxBackoff = 2048;
   static constexpr uint64_t kIdleFrames = 1800;  // evicted after this many frames without use
@@ -192,8 +201,8 @@ class Cache {
   Status lookup(const Key& key, uint32_t size, Entry*& e) {
     ++stats.lookups;
     const uint32_t epoch = epoch_.load(std::memory_order_acquire);
-    auto [it, inserted] = map_.try_emplace(key);
-    e = &it->second;
+    bool inserted = false;
+    e = find_or_insert(key, inserted);
     Entry& x = *e;
     x.lastUse = frame_;
     if (inserted) {
@@ -287,14 +296,17 @@ class Cache {
     if (!over && frame_ - lastSweep_ < 64) return;
     lastSweep_ = frame_;
     pressure_ = false;
+    bool erased = false;
     for (auto it = map_.begin(); it != map_.end();) {
       Entry& x = it->second;
       if (x.lastUse + kIdleFrames < frame_ && frame_ >= x.dynamicUntil) {
         if (x.region.valid()) ++stats.evictions;
         drop_region(x);
         it = map_.erase(it);
+        erased = true;
       } else ++it;
     }
+    if (erased) front_.fill({});  // it may name erased nodes
     const uint64_t target = budgetBytes / 4 * 3;
     if (resident_ <= target && !over) return;
     std::vector<std::pair<uint64_t, Entry*>> lru;
@@ -311,6 +323,7 @@ class Cache {
   void clear() {
     for (auto& [k, x] : map_) drop_region(x);
     map_.clear();
+    front_.fill({});
   }
 
   uint64_t resident_bytes() const { return resident_; }
@@ -321,6 +334,32 @@ class Cache {
   void (*onDynamic)(const Key& key, const Entry& entry, bool hintOnly) = nullptr;
 
  private:
+  struct FrontSlot {
+    Key key;
+    Entry* entry = nullptr;
+  };
+  static constexpr uint32_t kFrontSlots = 64;
+  static uint32_t front_slot(const Key& k) {
+    const uint32_t h = (k.addr ^ k.kind << 1 ^ uint32_t(k.params) * 0x85EBCA6Bu ^ k.extra) * 0x9E3779B1u;
+    return h >> 26;  // kFrontSlots = 64: the top 6 bits
+  }
+  // the map's entry for key (inserted: a new, empty one), through the front table when it is on
+  Entry* find_or_insert(const Key& key, bool& inserted) {
+    FrontSlot* slot = front ? &front_[front_slot(key)] : nullptr;
+    if (slot && slot->entry && slot->key == key) {
+      ++stats.frontHits;
+      if (frontVerify) {
+        auto it = map_.find(key);
+        if (it == map_.end() || &it->second != slot->entry) ++stats.frontMismatches;
+      }
+      inserted = false;
+      return slot->entry;
+    }
+    auto [it, added] = map_.try_emplace(key);
+    inserted = added;
+    if (slot) *slot = {key, &it->second};
+    return &it->second;
+  }
   static uint64_t round(uint64_t n) { return (std::max<uint64_t>(n, 16) + kAlign - 1) / kAlign * kAlign; }
   bool current(Entry& e) {
     const uint64_t seq = wwatch::write_seq();
@@ -352,6 +391,7 @@ class Cache {
 
   Backing& backing_;
   std::unordered_map<Key, Entry, KeyHash> map_;
+  std::array<FrontSlot, kFrontSlots> front_{};
   std::atomic<uint32_t> epoch_{0};
   uint64_t frame_ = 0, lastSweep_ = 0, resident_ = 0;
   bool pressure_ = false;

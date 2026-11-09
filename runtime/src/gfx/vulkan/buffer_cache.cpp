@@ -100,10 +100,14 @@ State& state() {
     break;
   }
   created->cache.keepShadow = buffer_cache_verify();  // verify() then never reads GPU memory
-  LOG("[vulkan buffer cache] on%s: budget %llu MiB, %s memory, hints %s", buffer_cache_verify() ? " (verify mode)" : "",
+  // WWHD_VK_BUFFER_CACHE_FRONT=1 (off by default): the front table of the last keys (buffer_cache_core.h);
+  // with WWHD_VK_BUFFER_CACHE_VERIFY=1 every front hit is also checked against the map
+  created->cache.front = env_is("WWHD_VK_BUFFER_CACHE_FRONT", "1");
+  created->cache.frontVerify = created->cache.front && buffer_cache_verify();
+  LOG("[vulkan buffer cache] on%s: budget %llu MiB, %s memory, hints %s%s", buffer_cache_verify() ? " (verify mode)" : "",
       (unsigned long long)(b.budget >> 20),
       (b.flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "device-local host-visible" : "host-visible",
-      env_is("WWHD_VK_BUFFER_CACHE_HINTS", "0") ? "off" : "on");
+      env_is("WWHD_VK_BUFFER_CACHE_HINTS", "0") ? "off" : "on", created->cache.front ? ", front table" : "");
   // WWHD_VK_BUFFER_CACHE_LOG=1: log the first 300 ranges that become dynamic
   if (env_is("WWHD_VK_BUFFER_CACHE_LOG", "1"))
     created->cache.onDynamic = [](const bufcache::Key& k, const bufcache::Entry& e, bool hintOnly) {
@@ -256,6 +260,13 @@ void buffer_cache_report(double frames) {
         (unsigned long long)(c.verifyChecks - o.verifyChecks), (unsigned long long)(c.verifyMismatches - o.verifyMismatches),
         (unsigned long long)(c.verifyRaced - o.verifyRaced), (unsigned long long)c.verifyChecks,
         (unsigned long long)c.verifyMismatches);
+  if (s.cache.frontVerify)
+    LOG("[vulkan buffer cache] front table: %.1f%% of lookups; verify: %llu mismatches (total %llu of %llu front hits)",
+        lookups ? 100.0 * double(c.frontHits - o.frontHits) / lookups : 0.0,
+        (unsigned long long)(c.frontMismatches - o.frontMismatches), (unsigned long long)c.frontMismatches,
+        (unsigned long long)c.frontHits);
+  else if (s.cache.front)
+    LOG("[vulkan buffer cache] front table: %.1f%% of lookups", lookups ? 100.0 * double(c.frontHits - o.frontHits) / lookups : 0.0);
   o = c;
 }
 
