@@ -194,6 +194,8 @@ class Cache {
   uint64_t frame() const { return frame_; }
   // any thread (save-state load): every entry is re-uploaded on its next use
   void invalidate_all() { epoch_.fetch_add(1, std::memory_order_acq_rel); }
+  // the save-state generation lookups compare entries with (invalidate_all)
+  uint32_t epoch() const { return epoch_.load(std::memory_order_acquire); }
 
   // Finds the entry for key covering size source bytes. kHit: e->region holds current bytes. kMiss: the
   // range is armed; read guest memory now (not earlier) and call upload(). kBypass: dynamic range, use

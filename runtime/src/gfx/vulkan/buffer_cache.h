@@ -29,6 +29,8 @@ bool cached_native_indices(uint32_t addr, uint32_t size, UploadSlice& out, bufca
 // Verify mode: report a mismatch found by Cache::verify
 void buffer_cache_mismatch(const char* what, const bufcache::Entry& entry, uint32_t size, uint32_t firstDiff);
 
+// the cache's save-state generation (bufcache::Cache::epoch; 0 while the cache was never used)
+uint32_t buffer_cache_epoch();
 void buffer_cache_end_frame();                       // render thread, once per swap
 void buffer_cache_invalidate_all();                  // save-state load (any thread)
 void buffer_cache_guest_invalidate(uint32_t flags, uint32_t addr, uint32_t size);  // GX2Invalidate

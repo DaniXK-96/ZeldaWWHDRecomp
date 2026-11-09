@@ -213,6 +213,11 @@ bool cached_native_indices(uint32_t addr, uint32_t size, UploadSlice& out, bufca
   return true;
 }
 
+uint32_t buffer_cache_epoch() {
+  State* s = g_state.load(std::memory_order_acquire);
+  return s ? s->cache.epoch() : 0;
+}
+
 void buffer_cache_end_frame() {
   State* s = g_state.load(std::memory_order_acquire);
   if (!s) return;

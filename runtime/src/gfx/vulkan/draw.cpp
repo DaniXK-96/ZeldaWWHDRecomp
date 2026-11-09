@@ -2287,11 +2287,15 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
 // The draw records its state as a full one does. With WWHD_VK_FASTPATH_VERIFY=N, every Nth partial
 // draw also runs the full resolution against everything it recorded (a mismatch is logged and ends
 // the continuation; that draw has already used the state).
+// WWHD_VK_STAGE_MEMO=1 (off by default): a continued draw takes a stage's descriptor set and dynamic
+// offsets from the last time the stage was bound (StageMemo) while everything that binding read is
+// unchanged; the stage's textures still get their sampling transitions. With WWHD_VK_FASTPATH_VERIFY=N
+// every Nth such stage is also bound as before and the two results compared.
 struct FastPathConfig {
   bool on = false;
   bool stats = false;
   uint32_t verifyEvery = 0;
-  bool oracle = false, profSplit = false, partial = false;
+  bool oracle = false, profSplit = false, partial = false, stageMemo = false;
 };
 const FastPathConfig& fastpath_config() {
   static const FastPathConfig config = [] {
@@ -2306,9 +2310,12 @@ const FastPathConfig& fastpath_config() {
     c.profSplit = c.on && ps && std::atoi(ps) != 0;
     const char* pa = std::getenv("WWHD_VK_FASTPATH_PARTIAL");
     c.partial = c.on && pa && std::atoi(pa) != 0;
+    const char* sm = std::getenv("WWHD_VK_STAGE_MEMO");
+    c.stageMemo = c.on && sm && std::atoi(sm) != 0;
     c.stats = preparation_stats_enabled() || c.verifyEvery || c.oracle;
-    LOG("[vulkan] continued-draw fast path %s%s%s%s%s", c.on ? "on" : "off (WWHD_VK_FASTPATH=0)", c.verifyEvery ? " (verify mode)" : "",
-        c.oracle ? " (oracle)" : "", c.profSplit ? " (profiler split)" : "", c.partial ? " (partial continuation)" : "");
+    LOG("[vulkan] continued-draw fast path %s%s%s%s%s%s", c.on ? "on" : "off (WWHD_VK_FASTPATH=0)", c.verifyEvery ? " (verify mode)" : "",
+        c.oracle ? " (oracle)" : "", c.profSplit ? " (profiler split)" : "", c.partial ? " (partial continuation)" : "",
+        c.stageMemo ? " (stage memo)" : "");
     return c;
   }();
   return config;
@@ -2445,6 +2452,9 @@ struct ContinuedStats {
   std::array<uint64_t, 2> partialStages{};
   // texture units of the stages resolved unit by unit (bind_stage units): reused, resolved
   uint64_t partialUnitsReused = 0, partialUnitsResolved = 0;
+  // WWHD_VK_STAGE_MEMO: stages of continued draws checked against their memo, taken from it; verified
+  std::array<uint64_t, 2> stageMemoChecks{}, stageMemoHits{}, stageMemoPatched{};
+  uint64_t stageMemoVerified = 0, stageMemoMismatches = 0, totalStageMemoVerified = 0, totalStageMemoMismatches = 0;
   std::array<uint64_t, kReasons> reasons{};
   std::array<uint64_t, gx2::kSgCount> groups{};  // register groups that ended a continuation
   std::array<uint64_t, 8> mismatchKinds{};
@@ -2578,6 +2588,19 @@ void report_continued_stats() {
                          pct(st.partialPipeline), pct(st.partialStages[0]), pct(st.partialStages[1]),
                          st.partialUnitsReused / frames, st.partialUnitsResolved / frames);
     }
+    if (fastpath_config().stageMemo && k < int(sizeof buf)) {
+      auto pct = [](uint64_t a, uint64_t n) { return n ? 100.0 * a / n : 0.0; };
+      k += std::snprintf(buf + k, sizeof buf - k,
+                         "; stage memo: vs %.1f%% of %.1f/frame (block offsets patched %.1f%%), ps %.1f%% of %.1f/frame (%.1f%%)",
+                         pct(st.stageMemoHits[0], st.stageMemoChecks[0]), st.stageMemoChecks[0] / frames,
+                         pct(st.stageMemoPatched[0], st.stageMemoChecks[0]),
+                         pct(st.stageMemoHits[1], st.stageMemoChecks[1]), st.stageMemoChecks[1] / frames,
+                         pct(st.stageMemoPatched[1], st.stageMemoChecks[1]));
+      if (fastpath_config().verifyEvery && k < int(sizeof buf))
+        k += std::snprintf(buf + k, sizeof buf - k, " (verify: %llu checked, %llu mismatches; total %llu of %llu)",
+                           (unsigned long long)st.stageMemoVerified, (unsigned long long)st.stageMemoMismatches,
+                           (unsigned long long)st.totalStageMemoMismatches, (unsigned long long)st.totalStageMemoVerified);
+    }
     if (fastpath_config().verifyEvery && k < int(sizeof buf))
       k += std::snprintf(buf + k, sizeof buf - k, "; verify: %llu checked, %llu mismatches (total %llu of %llu)",
                          (unsigned long long)st.verified, (unsigned long long)st.mismatches,
@@ -2586,11 +2609,14 @@ void report_continued_stats() {
   }
   if (fastpath_config().oracle) report_oracle(frames);
   const uint64_t totalMismatches = st.totalMismatches, totalVerified = st.totalVerified;
+  const uint64_t totalMemoVerified = st.totalStageMemoVerified, totalMemoMismatches = st.totalStageMemoMismatches;
   const auto kinds = st.mismatchKinds;
   st = {};
   st.lastFrame = R.frame;
   st.totalMismatches = totalMismatches;
   st.totalVerified = totalVerified;
+  st.totalStageMemoVerified = totalMemoVerified;
+  st.totalStageMemoMismatches = totalMemoMismatches;
   st.mismatchKinds = kinds;
 }
 // Render targets of a draw (both paths); false: the draw has no target.
@@ -2922,16 +2948,79 @@ Pipeline* masked_variant(Pipeline& own, const uint32_t* r, vk::Shader* vs, vk::S
   }
   return v;
 }
+// WWHD_VK_STAGE_MEMO (fastpath_config): what a stage's binding (bind_stage) read, with its result. A
+// continued draw takes the result again (stage_memo_matches) while all of it is unchanged:
+// - the same shader, set layout and uniform mode, in the same frame, submission (its upload slices and
+//   descriptor sets are alive), full state version and surface epoch (no texture, sampler, shader,
+//   target or other breaking register changed), the same scales (and so the artistic-mips bias);
+// - the registers it read: the words of the uniform blocks it binds, the dynamic words support uniforms
+//   are packed from (alpha reference, point size, viewport scales), and, when the shader reads ALU
+//   constants, no ALU constant change since (stageMemoAluSerial);
+// - guest memory: every uniform block came from the buffer cache (hit or upload) or from the display
+//   list's submitted copy, nothing was stamped by the write tracker since (wwatch::write_seq, checked
+//   before and after the blocks were looked up), no save-state load (buffer_cache_epoch), the same
+//   submitted-uniforms snapshot; shaders that copy guest uniform entries into their support uniforms
+//   (remapped buffer groups) are never memoized;
+//   a block whose words changed (a draw's own model matrix: a new block pointer) is looked up again in
+//   the buffer cache, as the binding does (not a display list's submitted copy); when its slice is in the
+//   same buffer with the same range, the descriptor set is the same and only the block's dynamic offset
+//   is patched (stage_memo_patch_blocks);
+// - its textures: the same surfaces, views and samplers (the continued state's), the same surface scales
+//   and artistic-mips flags (support uniforms hold the scales).
+// Not recorded with stereo, eye shifts, a stereo/backdrop replay record (replayOut), feedback copies,
+// AO substitutes, nor for the bloom extract (its scale is a live setting).
+struct StageMemoTexture {
+  uint32_t unit = 0;
+  int binding = -1;
+  Surface* surface = nullptr;
+  VkImageView view = VK_NULL_HANDLE;
+  VkSampler sampler = VK_NULL_HANDLE;
+  float sx = 0, sy = 0;
+  bool artisticMips = false;
+};
+struct StageMemo {
+  bool valid = false;
+  const vk::Shader* sh = nullptr;
+  VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+  bool dynamicUniforms = false, readsAlu = false;
+  uint64_t frame = 0, submission = 0, stateVersion = 0, surfaceEpoch = 0, writeSeq = 0, aluSerial = 0, submittedId = 0;
+  uint32_t cacheEpoch = 0;
+  int aoMode = 0;
+  float sx = 0, sy = 0;
+  std::array<uint32_t, 4> dynamicWords{};
+  std::array<uint32_t, 32> blockWords{};  // words 0 and 1 of each uniform block the shader binds
+  // per block: its slice's buffer and range, and its dynamic offset's index in out (-1: none, or not patchable)
+  std::array<VkBuffer, 16> blockBuffers{};
+  std::array<VkDeviceSize, 16> blockRanges{};
+  std::array<int8_t, 16> blockDynamic{};
+  uint32_t textureCount = 0;
+  std::array<StageMemoTexture, LATTE_NUM_MAX_TEX_UNITS> textures{};
+  StageResources out;
+};
+// per eye (stereo never memoizes; eye 1 keeps its own invalid memo) and stage
+std::array<std::array<StageMemo, 2>, 2> stageMemos;
+uint64_t stageMemoAluSerial = 0;  // draws that found ALU constants changed (draw)
+constexpr uint32_t kStageMemoDynamicRegs[4] = {REGADDR::SX_ALPHA_REF, REGADDR::PA_SU_POINT_SIZE, REGADDR::PA_CL_VPORT_XSCALE,
+                                               REGADDR::PA_CL_VPORT_YSCALE};
 StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                           VkDescriptorSetLayout layout, bool dynamicUniforms, float sx, float sy,
                           const std::array<Surface *, 8> &colors,
                           Surface *depth, FeedbackStatsProbe* feedbackProbe, float eyeOffset = 0,
                           bool sunShadow = false,
                           const ContinuedStage* reuse = nullptr, ContinuedStage* record = nullptr,
-                          StageReplay* replayOut = nullptr, const ContinuedStage* units = nullptr) {
+                          StageReplay* replayOut = nullptr, const ContinuedStage* units = nullptr,
+                          StageMemo* memo = nullptr) {
   const uint64_t stageEntered = rprof::sub_begin();
   StageResources out;
   auto &m = sh->mapping;
+  // WWHD_VK_STAGE_MEMO: whether this binding may be memoized (StageMemo); cleared by anything it does not cover
+  if (memo) memo->valid = false;
+  const uint64_t memoSeq = memo ? wwatch::write_seq() : 0;
+  bool memoable = memo && !replayOut && eyeOffset == 0 && stereo::frame.mode == stereo::Off && sh->dec &&
+                  (sh->uniforms.offset_remapped < 0 || sh->dec->list_remappedUniformEntries_bufferGroups.empty());
+  if (memo) memo->textureCount = 0;
+  std::array<UploadSlice, 16> memoBlockSlices{};  // the buffer cache slices of the guest blocks (StageMemo)
+  std::array<bool, 16> memoBlockPatchable{};
   // stereo eye 0: what eye 1 needs to bind this stage again (replay_stage)
   bool replayable = replayOut && dynamicUniforms && !(sunShadow && eyeOffset != 0);
   if (replayOut) replayOut->valid = false, replayOut->uniformCount = 0, replayOut->textureCount = 0,
@@ -3012,6 +3101,11 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     const bool cached = known || (guestAddr && buffer_cache_enabled() &&
         cached_guest_range(guestAddr, uint32_t(size), rprof::kUpUbo, cachedSlice));
     if (known) cachedSlice = *known;
+    if (logicalSlot != 16 && !cached) memoable = false;  // a guest block through the arena: no exact identity
+    if (memoable && logicalSlot < 16) {
+      memoBlockSlices[logicalSlot] = cachedSlice;
+      memoBlockPatchable[logicalSlot] = guestAddr != 0;  // from the buffer cache by address (not submitted)
+    }
     const auto b = cached ? cachedSlice
         : reuseUniforms
         ? uniformCache.get(R.device, R.submissionGeneration,
@@ -3102,6 +3196,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   else
     supportUniforms.clear();
   // Bloom extract cThresholdParam.z: scale once, before blur/downsampling.
+  if (!sh->vertex && (r[mmSQ_PGM_START_PS] << 8) == 0x44F91200) memoable = false;  // a live setting (bloom strength)
   if (!sh->vertex && (r[mmSQ_PGM_START_PS] << 8) == 0x44F91200 &&
       sh->uniforms.offset_remapped >= 0 && size_t(sh->uniforms.offset_remapped) < supportUniforms.size())
     render::scale_bloom_uniforms(supportUniforms.data() + sh->uniforms.offset_remapped,
@@ -3194,6 +3289,11 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       ::gfx::area_sample::scale_gather_grid(reinterpret_cast<float*>(supportUniforms.data() + sh->uniforms.offset_remapped),
                                             (supportUniforms.size() - sh->uniforms.offset_remapped) / 16, s->width, s->height,
                                             s->sx, s->sy);
+    if (memoable) {
+      if (memo->textureCount < memo->textures.size())
+        memo->textures[memo->textureCount++] = {unit, binding, s, view, samplerValue, s->sx, s->sy, s->artisticMips};
+      else memoable = false;
+    }
     if (imageCount >= imageInfos.size())
       exception_report::raise("stage image descriptor capacity exceeded");
     auto &info = imageInfos[imageCount++];
@@ -3280,6 +3380,7 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                             : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT));
     VkSampler samplerValue = resolve_sampler(r, sh, unit, s);
+    if (aliases || substituted) memoable = false;  // a feedback copy or the AO substitute
     bindTexture(unit, binding, s, sampledView, samplerValue);
     replayTexture(s, unit, binding, aliases || substituted);
     if (record) {
@@ -3351,7 +3452,101 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     }
   }
   out.set = stage_descriptor_set(sh->vertex, layout, writes.data(), writeCount);
+  // nothing stamped while the blocks were looked up: each was current at memoSeq
+  if (memoable && wwatch::write_seq() == memoSeq) {
+    auto& c = *memo;
+    c.sh = sh;
+    c.layout = layout;
+    c.dynamicUniforms = dynamicUniforms;
+    c.readsAlu = sh->uniforms.offset_uniformRegister >= 0 ||
+                 (sh->uniforms.offset_remapped >= 0 && !sh->dec->list_remappedUniformEntries_register.empty());
+    c.frame = R.frame;
+    c.submission = R.submissionGeneration;
+    c.stateVersion = gx2::g_full_state_version;
+    c.surfaceEpoch = g_surface_epoch;
+    c.writeSeq = memoSeq;
+    c.aluSerial = stageMemoAluSerial;
+    c.submittedId = gx2::submitted_uniforms_id();
+    c.cacheEpoch = buffer_cache_epoch();
+    c.aoMode = ao_mode();
+    c.sx = sx;
+    c.sy = sy;
+    for (int i = 0; i < 4; ++i) c.dynamicWords[i] = r[kStageMemoDynamicRegs[i]];
+    for (int i = 0; i < 16; ++i) {
+      const bool bound = m.uniformBuffersBindingPoint[i] >= 0;
+      c.blockWords[i * 2] = bound ? r[block + i * 7] : 0;
+      c.blockWords[i * 2 + 1] = bound ? r[block + i * 7 + 1] : 0;
+    }
+    c.out = out;
+    for (int i = 0; i < 16; ++i) {
+      c.blockBuffers[i] = memoBlockSlices[i].buffer;
+      c.blockRanges[i] = memoBlockSlices[i].size;
+      c.blockDynamic[i] = -1;
+      if (!dynamicUniforms || !memoBlockPatchable[i] || m.uniformBuffersBindingPoint[i] < 0) continue;
+      for (uint32_t j = 0; j < dynamicCount; ++j)
+        if (dynamicBindings[j].first == uint32_t(m.uniformBuffersBindingPoint[i])) c.blockDynamic[i] = int8_t(j);
+    }
+    c.valid = true;
+  }
   return out;
+}
+// WWHD_VK_STAGE_MEMO: whether a continued draw's stage (reuse: the continued state's textures) reads
+// exactly what memo c recorded (StageMemo)
+// changedBlocks: the bound uniform blocks whose words differ (true is returned only with none, or with
+// all of them patchable: stage_memo_patch_blocks)
+bool stage_memo_matches(const StageMemo& c, const uint32_t* r, const vk::Shader* sh, VkDescriptorSetLayout layout,
+                        bool dynamicUniforms, float sx, float sy, const ContinuedStage& reuse, uint32_t& changedBlocks) {
+  changedBlocks = 0;
+  if (!c.valid || c.sh != sh || c.layout != layout || c.dynamicUniforms != dynamicUniforms || c.frame != R.frame ||
+      c.submission != R.submissionGeneration || c.stateVersion != gx2::g_full_state_version ||
+      c.surfaceEpoch != g_surface_epoch || c.writeSeq != wwatch::write_seq() || c.cacheEpoch != buffer_cache_epoch() ||
+      c.submittedId != gx2::submitted_uniforms_id() || c.aoMode != ao_mode() || (c.readsAlu && c.aluSerial != stageMemoAluSerial) ||
+      std::memcmp(&c.sx, &sx, 4) || std::memcmp(&c.sy, &sy, 4))
+    return false;
+  for (int i = 0; i < 4; ++i)
+    if (c.dynamicWords[i] != r[kStageMemoDynamicRegs[i]]) return false;
+  const uint32_t block = sh->vertex ? mmSQ_VTX_UNIFORM_BLOCK_START : mmSQ_PS_UNIFORM_BLOCK_START;
+  for (int i = 0; i < 16; ++i)
+    if (sh->mapping.uniformBuffersBindingPoint[i] >= 0 &&
+        (c.blockWords[i * 2] != r[block + i * 7] || c.blockWords[i * 2 + 1] != r[block + i * 7 + 1])) {
+      if (c.blockDynamic[i] < 0 || !r[block + i * 7]) return false;
+      changedBlocks |= 1u << i;
+    }
+  if (c.textureCount != reuse.count) return false;
+  for (uint32_t i = 0; i < reuse.count; ++i) {
+    const auto& m = c.textures[i];
+    const auto& t = reuse.textures[i];
+    if (m.unit != t.unit || m.binding != t.binding || m.surface != t.surface || m.view != t.view || m.sampler != t.sampler ||
+        std::memcmp(&m.sx, &t.surface->sx, 4) || std::memcmp(&m.sy, &t.surface->sy, 4) || m.artisticMips != t.surface->artisticMips)
+      return false;
+  }
+  return true;
+}
+// The changed blocks of a matching memo (stage_memo_matches): each looked up as bind_stage looks it up
+// (not a display list's submitted copy, from the buffer cache); true when every slice is in the memo's
+// buffer with its range and nothing was stamped meanwhile: their dynamic offsets are patched into the
+// memo, which stays valid for the new block words. false: bind the stage as usual (the memo is replaced).
+bool stage_memo_patch_blocks(StageMemo& c, const uint32_t* r, const vk::Shader* sh, uint32_t changedBlocks) {
+  const uint32_t block = sh->vertex ? mmSQ_VTX_UNIFORM_BLOCK_START : mmSQ_PS_UNIFORM_BLOCK_START;
+  std::array<uint32_t, 16> offsets{};
+  for (int i = 0; i < 16; ++i) {
+    if (!(changedBlocks >> i & 1)) continue;
+    const uint32_t addr = r[block + i * 7], size = std::min<uint32_t>(r[block + i * 7 + 1] + 1, 0x10000);
+    if (size > R.properties.limits.maxUniformBufferRange || gx2::submitted_uniform_block(addr, size)) return false;
+    UploadSlice b;
+    if (!buffer_cache_enabled() || !cached_guest_range(addr, size, rprof::kUpUbo, b)) return false;
+    if (b.buffer != c.blockBuffers[i] || b.size != c.blockRanges[i] || b.offset > UINT32_MAX) return false;
+    offsets[i] = uint32_t(b.offset);
+    rprof::guest_read(rprof::kUpUbo, addr, size);
+  }
+  if (wwatch::write_seq() != c.writeSeq) return false;
+  for (int i = 0; i < 16; ++i) {
+    if (!(changedBlocks >> i & 1)) continue;
+    c.out.dynamicOffsets[c.blockDynamic[i]] = offsets[i];
+    c.blockWords[i * 2] = r[block + i * 7];
+    c.blockWords[i * 2 + 1] = r[block + i * 7 + 1];
+  }
+  return true;
 }
 // The stage's descriptor set for these writes: reused within the submission, else written.
 VkDescriptorSet stage_descriptor_set(bool vertex, VkDescriptorSetLayout layout,
@@ -3657,6 +3852,7 @@ bool clouds_pass_subset_ok(const std::array<Surface*, 8>& colors, const Surface*
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent) {
   const uint32_t dirtyGroups = gx2::take_dirty_groups();  // register groups changed since the previous draw
+  stageMemoAluSerial += dirtyGroups >> gx2::kSgAluConst & 1;  // WWHD_VK_STAGE_MEMO (StageMemo)
   if (__builtin_expect(fastpath_config().oracle, 0))
     for (auto& g : oracle.groups) g |= dirtyGroups;
   if (__builtin_expect(fastpath_config().partial, 0))
@@ -4147,20 +4343,74 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     // Bind the already resolved sets/offsets, never replay_stage/bind_stage.
     if(!backdrop_reuse_resources(*backdropReplay,p,vs,ps,R.submissionGeneration,vres,pres))return;
   } else {
-  if (!replayStages || !replay->stages[0].valid ||
-      !replay_stage(replay->stages[0], r, vs, cameraEye, colors, depth, vres))
+  // WWHD_VK_STAGE_MEMO: the draws whose stage bindings are memoized (StageMemo; bind_stage leaves out what
+  // the memo does not cover), and a continued draw's stage taken from its memo (stage_memo_matches): its
+  // textures get the sampling transitions the binding gives them, as on the continued path
+  const bool memoStages = fastPath.stageMemo && fastPathDraw && !shadersOut && !backdropReplay &&
+                          stereo::frame.mode == stereo::Off;
+  auto memoOf = [&](int s) { return memoStages ? &stageMemos[stereoEye][s] : nullptr; };
+  auto fromMemo = [&](int s, vk::Shader* sh, float eyeOffset, StageResources& res) {
+    if (!memoStages || !fast || eyeOffset != 0) return false;
+    auto& c = stageMemos[stereoEye][s];
+    ++continuedStats.stageMemoChecks[s];
+    uint32_t changedBlocks = 0;
+    if (!stage_memo_matches(c, r, sh, p.sets[s], p.dynamicUniforms, sx, sy, continued.stages[s], changedBlocks) ||
+        (changedBlocks && !stage_memo_patch_blocks(c, r, sh, changedBlocks)))
+      return false;
+    ++continuedStats.stageMemoHits[s];
+    continuedStats.stageMemoPatched[s] += changedBlocks != 0;
+    static uint64_t memoVerifyCounter = 0;
+    if (fastPath.verifyEvery && ++memoVerifyCounter % fastPath.verifyEvery == 0) {
+      // the binding as without the memo, compared with the memo's result (which it replaces)
+      const StageResources memoized = c.out;
+      res = bind_stage(r, sh, p.sets[s], p.dynamicUniforms, sx, sy, colors, depth, probe, eyeOffset, sunShadow,
+                       &continued.stages[s], nullptr, nullptr, nullptr, &c);
+      auto& st = continuedStats;
+      ++st.stageMemoVerified;
+      ++st.totalStageMemoVerified;
+      if (res.set != memoized.set || res.dynamicOffsetCount != memoized.dynamicOffsetCount ||
+          !std::equal(res.dynamicOffsets.begin(), res.dynamicOffsets.begin() + res.dynamicOffsetCount,
+                      memoized.dynamicOffsets.begin())) {
+        ++st.stageMemoMismatches;
+        ++st.totalStageMemoMismatches;
+        static int logged = 0;
+        if (logged++ < 50)
+          LOG("[vulkan stage memo] verify mismatch #%llu: %s shader %016llx, set %s, %u/%u dynamic offsets; frame %llu draw %llu",
+              (unsigned long long)st.totalStageMemoMismatches, sh->vertex ? "vertex" : "pixel", (unsigned long long)sh->key,
+              res.set == memoized.set ? "same" : "differs", res.dynamicOffsetCount, memoized.dynamicOffsetCount,
+              (unsigned long long)R.frame, (unsigned long long)R.drawCount);
+      }
+      return true;
+    }
+    const auto& stage = continued.stages[s];
+    for (uint32_t i = 0; i < stage.count; ++i)
+      sample_transition(stage.textures[i].surface,
+                        narrow_barriers()
+                            ? (sh->vertex ? VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+                            : (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT));
+    rprof::mark(rprof::kTextures);
+    res = c.out;
+    rprof::mark(rprof::kDescriptors);
+    return true;
+  };
+  if ((!replayStages || !replay->stages[0].valid ||
+       !replay_stage(replay->stages[0], r, vs, cameraEye, colors, depth, vres)) &&
+      !fromMemo(0, vs, cameraEye, vres))
     vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, cameraEye, sunShadow,
                       fast || partialStage[0] ? &continued.stages[0] : nullptr,
                       recordState && !partialStage[0] ? &continued.stages[0] : nullptr,
-                      shadersOut ? &shadersOut->stages[0] : nullptr, partialByUnit[0] ? &*partialUnits[0] : nullptr);
+                      shadersOut ? &shadersOut->stages[0] : nullptr, partialByUnit[0] ? &*partialUnits[0] : nullptr,
+                      memoOf(0));
   partial_stage(1);
-  if (!replayStages || !replay->stages[1].valid ||
-      !replay_stage(replay->stages[1], r, ps, sunShadow ? cameraEye : 0, colors, depth, pres))
+  if ((!replayStages || !replay->stages[1].valid ||
+       !replay_stage(replay->stages[1], r, ps, sunShadow ? cameraEye : 0, colors, depth, pres)) &&
+      !fromMemo(1, ps, sunShadow ? cameraEye : 0, pres))
     pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe,
                       sunShadow ? cameraEye : 0, sunShadow,
                       fast || partialStage[1] ? &continued.stages[1] : nullptr,
                       recordState && !partialStage[1] ? &continued.stages[1] : nullptr,
-                      shadersOut ? &shadersOut->stages[1] : nullptr, partialByUnit[1] ? &*partialUnits[1] : nullptr);
+                      shadersOut ? &shadersOut->stages[1] : nullptr, partialByUnit[1] ? &*partialUnits[1] : nullptr,
+                      memoOf(1));
   }
   if (shadersOut) {
     shadersOut->targets=targets;
